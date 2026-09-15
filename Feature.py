@@ -1,10 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""
-Optimized feature extraction (ESM + SaProt + GVP + pocket physicochemical/spatial/electronic cloud/amino acid features)
-Input: protein PDB file + pocket PDB file
-Output: a single .pkl file containing all fields required for training/prediction
-"""
+
 
 import pickle
 import logging

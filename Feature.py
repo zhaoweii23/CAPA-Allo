@@ -1,9 +1,9 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-优化版特征提取（ESM + SaProt + GVP + 口袋理化/空间/电子云/氨基酸特征）
-输入：蛋白 PDB 文件 + 口袋 PDB 文件
-输出：单个 .pkl 文件，包含所有训练/预测所需字段
+Optimized feature extraction (ESM + SaProt + GVP + pocket physicochemical/spatial/electronic cloud/amino acid features)
+Input: protein PDB file + pocket PDB file
+Output: a single .pkl file containing all fields required for training/prediction
 """
 
 import pickle
@@ -33,33 +33,33 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
-# ==================== 全局配置 ====================
+# ==================== Global Configuration ====================
 class GlobalConfig:
-    # 数据路径
+    # Data paths
     PROTEIN_PDB_DIR = "data/raw/extracted_chains/"
     ALLOSTERIC_POCKET_DIR = "data/raw/Allosteric_Pocket/"
     FEATURE_PKL_DIR = "data/processed/features_allosteric_pkl_saprot/"
 
-    # 设备
+    # Device
     USE_GPU = torch.cuda.is_available()
     GPU_DEVICE = torch.device('cuda:4' if USE_GPU else 'cpu')
 
-    # 特征开关
+    # Feature switches
     USE_ESM = True
     USE_SAPROT = True
 
-    # ESM 参数
+    # ESM parameters
     ESM_MODEL_NAME = "esm2_t33_650M_UR50D"
     ESM_MAX_LEN = 1024
     ESM_SEGMENT_STRIDE = 1024
 
-    # SaProt 参数
-    SAPROT_MODEL_PATH = "SaProt_650M_AF2"   # 请确认实际路径
+    # SaProt parameters
+    SAPROT_MODEL_PATH = "SaProt_650M_AF2"   # Please confirm the actual path
 
-    # 口袋邻域半径
+    # Pocket neighborhood radius
     NEIGHBOR_DISTANCE = 10.0
 
-    # GVP 内坐标截断半径
+    # GVP internal coordinate cutoff radius
     GVP_CUTOFF = 8.0
 
     @classmethod
@@ -68,7 +68,7 @@ class GlobalConfig:
         Path("data/processed/").mkdir(parents=True, exist_ok=True)
 
 
-# ==================== 氨基酸映射 ====================
+# ==================== Amino Acid Mapping ====================
 three_to_one = {
     'ALA': 'A', 'CYS': 'C', 'ASP': 'D', 'GLU': 'E', 'PHE': 'F', 'GLY': 'G',
     'HIS': 'H', 'ILE': 'I', 'LYS': 'K', 'LEU': 'L', 'MET': 'M', 'ASN': 'N',
@@ -78,7 +78,7 @@ three_to_one = {
 
 
 def get_aligned_residues_and_coords(structure):
-    """提取排序后的残基、序列和 CA 坐标数组"""
+    """Extract sorted residues, sequence, and CA coordinate array"""
     residues = []
     model = structure[0]
     for chain in model:
@@ -107,7 +107,7 @@ def get_residues_from_pocket_pdb(pocket_pdb: str) -> List:
 
 
 def align_pocket_to_residues(pocket_residues, full_residues):
-    """返回口袋残基在全蛋白残基列表中的索引"""
+    """Return indices of pocket residues in the full protein residue list"""
     pocket_ids = [(r.get_parent().id, r.id[1], r.id[2]) for r in pocket_residues]
     indices = []
     for pid in pocket_ids:
@@ -116,12 +116,12 @@ def align_pocket_to_residues(pocket_residues, full_residues):
                 indices.append(idx)
                 break
         else:
-            logger.warning(f"口袋残基 {pid} 未在全蛋白中找到")
+            logger.warning(f"Pocket residue {pid} not found in full protein")
     return indices
 
 
 def compute_pocket_neighbors(pocket_indices, full_residues, threshold=10.0):
-    """根据口袋中心计算邻域残基索引及各残基到口袋中心的距离"""
+    """Compute neighbor residue indices and distances to pocket center based on pocket center"""
     ca_coords = np.array([r['CA'].coord for r in full_residues])
     pocket_coords = ca_coords[pocket_indices]
     if len(pocket_coords) == 0:
@@ -133,12 +133,12 @@ def compute_pocket_neighbors(pocket_indices, full_residues, threshold=10.0):
 
 
 def seq_to_high_conf_struc_seq(aa_sequence: str) -> str:
-    """将氨基酸序列转换为高置信度结构序列（每个残基：aa+自身折叠字母）"""
+    """Convert amino acid sequence to high-confidence structure sequence (each residue: aa + its own fold letter)"""
     return "".join(f"{aa}{aa}" for aa in aa_sequence)
 
 
 def find_corresponding_protein(pocket_file: str, protein_dir: str) -> Optional[str]:
-    """根据口袋文件名查找对应的完整蛋白 PDB"""
+    """Find the corresponding full protein PDB based on pocket file name"""
     base_name = Path(pocket_file).stem
     pdb_id = base_name.split('_')[0]
     protein_dir_path = Path(protein_dir)
@@ -146,7 +146,7 @@ def find_corresponding_protein(pocket_file: str, protein_dir: str) -> Optional[s
     return str(candidates[0]) if candidates else None
 
 
-# ==================== ESM 特征提取器 ====================
+# ==================== ESM Feature Extractor ====================
 class ESM2FeatureExtractor:
     _instance = None
     _initialized = False
@@ -160,7 +160,7 @@ class ESM2FeatureExtractor:
         if not self._initialized:
             self.config = config or GlobalConfig()
             self.device = self.config.GPU_DEVICE
-            logger.info(f"初始化 ESM 模型: {self.config.ESM_MODEL_NAME} 设备: {self.device}")
+            logger.info(f"Initializing ESM model: {self.config.ESM_MODEL_NAME} device: {self.device}")
             self.esm_model, self.alphabet = pretrained.load_model_and_alphabet(self.config.ESM_MODEL_NAME)
             self.esm_model = self.esm_model.to(self.device)
             self.esm_model.eval()
@@ -179,7 +179,7 @@ class ESM2FeatureExtractor:
         return embeddings[1:len(sequence)+1].cpu().numpy()
 
 
-# ==================== SaProt 特征提取器 ====================
+# ==================== SaProt Feature Extractor ====================
 class SaProtFeatureExtractor:
     _instance = None
     _initialized = False
@@ -193,7 +193,7 @@ class SaProtFeatureExtractor:
         if not self._initialized:
             self.config = config or GlobalConfig()
             self.device = self.config.GPU_DEVICE
-            logger.info(f"初始化 SaProt 模型: {self.config.SAPROT_MODEL_PATH} 设备: {self.device}")
+            logger.info(f"Initializing SaProt model: {self.config.SAPROT_MODEL_PATH} device: {self.device}")
             self.tokenizer = EsmTokenizer.from_pretrained(self.config.SAPROT_MODEL_PATH)
             self.model = AutoModel.from_pretrained(self.config.SAPROT_MODEL_PATH)
             self.model = self.model.to(self.device)
@@ -208,22 +208,22 @@ class SaProtFeatureExtractor:
         with torch.no_grad():
             outputs = self.model(**inputs, output_hidden_states=True)
             hidden = outputs.hidden_states[-1][0, 1:-1, :]  # (T, D)
-        # 取偶数索引作为残基嵌入
+        # Take even indices as residue embeddings
         residue_emb = hidden[0::2, :]
         return residue_emb.cpu().numpy()
 
 
-# ==================== GVP 内坐标计算 ====================
+# ==================== GVP Internal Coordinate Computation ====================
 def generate_inner_coor(pos, atom_feats, edge_index, cutoff=8.0):
     """
-    计算边上的内坐标特征：dist, theta, phi, tau
+    Compute internal coordinate features on edges: dist, theta, phi, tau
     """
     num_nodes = atom_feats.size(0)
     j, i = edge_index
     vecs = pos[j] - pos[i]
     dist = vecs.norm(dim=-1)
 
-    # 第一个最近邻居
+    # First nearest neighbor
     _, argmin0 = scatter_min(dist, i, dim_size=num_nodes)
     argmin0[argmin0 >= len(i)] = 0
     n0 = j[argmin0]
@@ -234,7 +234,7 @@ def generate_inner_coor(pos, atom_feats, edge_index, cutoff=8.0):
     argmin1[argmin1 >= len(i)] = 0
     n1 = j[argmin1]
 
-    # 发送端最近邻居
+    # Sender-side nearest neighbor
     _, argmin0_j = scatter_min(dist, j, dim_size=num_nodes)
     argmin0_j[argmin0_j >= len(j)] = 0
     n0_j = i[argmin0_j]
@@ -247,7 +247,7 @@ def generate_inner_coor(pos, atom_feats, edge_index, cutoff=8.0):
 
     n0 = n0[i]; n1 = n1[i]; n0_j = n0_j[j]; n1_j = n1_j[j]
 
-    # 参考点选择
+    # Reference point selection
     mask_iref = n0 == j
     iref = torch.clone(n0)
     iref[mask_iref] = n1[mask_iref]
@@ -266,7 +266,7 @@ def generate_inner_coor(pos, atom_feats, edge_index, cutoff=8.0):
     pos_iref = vecs[idx_iref]
     pos_jref_j = vecs[idx_jref]
 
-    # 计算角度特征
+    # Compute angle features
     a = ((-pos_ji) * pos_in0).sum(dim=-1)
     b = torch.cross(-pos_ji, pos_in0, dim=-1).norm(dim=-1)
     theta = torch.atan2(b, a)
@@ -290,7 +290,7 @@ def generate_inner_coor(pos, atom_feats, edge_index, cutoff=8.0):
     return dist, theta, phi, tau
 
 
-# ==================== 口袋几何/空间特征提取器 ====================
+# ==================== Pocket Geometry/Spatial Feature Extractor ====================
 class ProteinSpatialFeatureExtractor:
     def __init__(self):
         self.pdb_parser = PDBParser(QUIET=True)
@@ -305,7 +305,7 @@ class ProteinSpatialFeatureExtractor:
             features.update(self._extract_allosteric_signature_features(pocket_residues))
             return features
         except Exception as e:
-            logger.error(f"提取空间特征失败: {e}")
+            logger.error(f"Failed to extract spatial features: {e}")
             return self._get_default_geometric_features()
 
     def _extract_geometric_features(self, residues: List) -> Dict:
@@ -539,7 +539,7 @@ class ProteinSpatialFeatureExtractor:
         }
 
 
-# ==================== 电子云特征提取器 ====================
+# ==================== Electron Cloud Feature Extractor ====================
 class ElectronCloudFeatureExtractor:
     def __init__(self):
         self.electronegativity = {
@@ -563,7 +563,7 @@ class ElectronCloudFeatureExtractor:
             features.update(self._extract_hbond_network_features(pocket_residues))
             return features
         except Exception as e:
-            logger.error(f"提取电子云特征失败: {e}")
+            logger.error(f"Failed to extract electron cloud features: {e}")
             return self._get_default_electron_features()
 
     def _extract_protein_electron_features(self, residues: List) -> Dict:
@@ -664,7 +664,7 @@ class ElectronCloudFeatureExtractor:
         }
 
 
-# ==================== 氨基酸组成特征提取器 ====================
+# ==================== Amino Acid Composition Feature Extractor ====================
 class AminoAcidFeatureExtractor:
     def __init__(self):
         self.aa_properties = {
@@ -763,7 +763,7 @@ class AminoAcidFeatureExtractor:
         }
 
 
-# ==================== 主特征提取器 ====================
+# ==================== Main Feature Extractor ====================
 class SimpleProteinFeatureExtractor:
     def __init__(self, config=None):
         self.config = config or GlobalConfig()
@@ -833,7 +833,7 @@ class SimpleProteinFeatureExtractor:
         features = {}
         seq_len = len(full_sequence)
 
-        # 1. ESM 特征
+        # 1. ESM features
         if self.config.USE_ESM:
             if seq_len <= self.config.ESM_MAX_LEN:
                 features['protein_esm'] = self._get_esm_embedding(full_sequence)
@@ -842,7 +842,7 @@ class SimpleProteinFeatureExtractor:
                 features['protein_esm'] = None
                 features['protein_esm_segments'] = self._get_segmented_esm_embeddings(full_sequence)
 
-        # 2. SaProt 特征
+        # 2. SaProt features
         if self.config.USE_SAPROT:
             struc_seq = seq_to_high_conf_struc_seq(full_sequence)
             max_tokens = self.config.ESM_MAX_LEN * 2
@@ -853,7 +853,7 @@ class SimpleProteinFeatureExtractor:
                 features['protein_saprot'] = None
                 features['protein_saprot_segments'] = self._get_segmented_saprot_embeddings(struc_seq)
 
-        # 3. 全长 GVP 特征
+        # 3. Full-length GVP features
         full_protein_gvp, full_graph, full_coords = self._generate_gvp_from_residues(
             full_residues, full_sequence, device=self.device
         )
@@ -862,27 +862,27 @@ class SimpleProteinFeatureExtractor:
             cutoff=self.config.GVP_CUTOFF
         )
 
-        # 4. 口袋残基索引与邻域信息
+        # 4. Pocket residue indices and neighborhood information
         pocket_indices = align_pocket_to_residues(pocket_residues, full_residues)
         neighbor_indices, distances = compute_pocket_neighbors(
             pocket_indices, full_residues, self.config.NEIGHBOR_DISTANCE
         )
 
-        # 5. 口袋空间/几何特征
+        # 5. Pocket spatial/geometric features
         spatial_extractor = ProteinSpatialFeatureExtractor()
         spatial_features = spatial_extractor.extract_spatial_features(
             pocket_residues, full_protein_structure=full_structure
         )
 
-        # 6. 电子云特征
+        # 6. Electron cloud features
         electron_extractor = ElectronCloudFeatureExtractor()
         electron_features = electron_extractor.extract_electron_cloud_features(pocket_residues)
 
-        # 7. 氨基酸组成特征
+        # 7. Amino acid composition features
         aa_extractor = AminoAcidFeatureExtractor()
         aa_features = aa_extractor.extract_amino_acid_features(pocket_residues)
 
-        # 汇总所有特征
+        # Aggregate all features
         features.update({
             'pdb_id': None,
             'protein_seq': full_sequence,
@@ -906,25 +906,25 @@ class SimpleProteinFeatureExtractor:
         pdb_id = pocket_file.stem
         pkl_path = Path(self.config.FEATURE_PKL_DIR) / f"{pdb_id}_features.pkl"
         if pkl_path.exists():
-            logger.info(f"跳过已处理: {pdb_id}")
+            logger.info(f"Skipping already processed: {pdb_id}")
             return None
 
         pocket_residues = get_residues_from_pocket_pdb(str(pocket_file))
         if len(pocket_residues) < 3:
-            logger.warning(f"口袋残基数不足: {pocket_file}")
+            logger.warning(f"Insufficient number of pocket residues: {pocket_file}")
             return None
 
         if protein_file is None:
             protein_file = find_corresponding_protein(str(pocket_file), self.config.PROTEIN_PDB_DIR)
         if protein_file is None:
-            logger.error(f"未找到对应蛋白文件: {pocket_file}")
+            logger.error(f"Corresponding protein file not found: {pocket_file}")
             return None
 
         parser = PDBParser(QUIET=True)
         full_structure = parser.get_structure('protein', protein_file)
         full_residues, full_sequence, _ = get_aligned_residues_and_coords(full_structure)
         if not full_sequence:
-            logger.error(f"蛋白序列为空: {protein_file}")
+            logger.error(f"Protein sequence is empty: {protein_file}")
             return None
 
         try:
@@ -932,13 +932,13 @@ class SimpleProteinFeatureExtractor:
                                              full_sequence, full_residues,
                                              protein_file=protein_file)
         except Exception as e:
-            logger.error(f"处理 {pocket_file} 失败: {e}")
+            logger.error(f"Failed to process {pocket_file}: {e}")
             return None
 
         features['pdb_id'] = pdb_id
         features['site_id'] = f"{pdb_id}_site"
 
-        # 打印长度信息
+        # Print length information
         log_msg = f"{pdb_id}: seq_len={len(full_sequence)}"
         if features.get('protein_esm') is not None:
             log_msg += f", ESM_len={features['protein_esm'].shape[0]}"
@@ -953,11 +953,11 @@ class SimpleProteinFeatureExtractor:
 
         with open(pkl_path, 'wb') as f:
             pickle.dump(features, f, protocol=pickle.HIGHEST_PROTOCOL)
-        logger.info(f"特征保存: {pkl_path}")
+        logger.info(f"Features saved: {pkl_path}")
         return features
 
 
-# ==================== 主程序 ====================
+# ==================== Main Program ====================
 def main():
     logging.basicConfig(
         level=logging.INFO,
@@ -967,29 +967,29 @@ def main():
             logging.StreamHandler()
         ]
     )
-    logger.info("=== 特征提取系统启动（ESM + SaProt + GVP + 口袋理化特征）===")
+    logger.info("=== Feature extraction system started (ESM + SaProt + GVP + pocket physicochemical features) ===")
     start_time = time.time()
 
     GlobalConfig.create_directories()
 
     pocket_dir = Path(GlobalConfig.ALLOSTERIC_POCKET_DIR)
     if not pocket_dir.exists():
-        logger.error(f"口袋目录不存在: {pocket_dir}")
+        logger.error(f"Pocket directory does not exist: {pocket_dir}")
         sys.exit(1)
 
     pocket_files = list(pocket_dir.glob("*.pdb"))
-    logger.info(f"找到 {len(pocket_files)} 个口袋PDB文件")
+    logger.info(f"Found {len(pocket_files)} pocket PDB files")
 
     extractor = SimpleProteinFeatureExtractor()
     success_count = 0
-    for pf in tqdm(pocket_files, desc="提取特征"):
+    for pf in tqdm(pocket_files, desc="Extracting features"):
         result = extractor.extract_and_save(pf)
         if result is not None:
             success_count += 1
 
     elapsed = time.time() - start_time
-    logger.info(f"处理完成: 成功 {success_count} 个，失败 {len(pocket_files)-success_count} 个")
-    logger.info(f"总耗时: {elapsed:.2f} 秒")
+    logger.info(f"Processing complete: {success_count} succeeded, {len(pocket_files)-success_count} failed")
+    logger.info(f"Total time: {elapsed:.2f} seconds")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-
 import os, sys, argparse, pickle, logging, json
 from pathlib import Path
 import numpy as np
@@ -33,7 +32,9 @@ def parse_args():
     parser.add_argument('--test_split', type=float, default=0.15)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--n_runs', type=int, default=1, help='Number of repeats per experiment group')
-  
+    parser.add_argument('--split_dir', type=str, default='./data_splits',
+                        help='Directory containing train_pdb_ids.txt, val_pdb_ids.txt, test_pdb_ids.txt')
+
     parser.add_argument('--use_geom', type=lambda x: x.lower() in ['true','1','yes'], default=True,
                         help='Whether to use GVP geometric features')
     parser.add_argument('--use_agg', type=lambda x: x.lower() in ['true','1','yes'], default=True,
@@ -142,18 +143,6 @@ def collect_proteins(pos_dir, neg_dir):
         return df
     df['pdb_id'] = df['pkl_path'].apply(lambda x: Path(x).stem.replace('_features', ''))
     logger.info(f"Total valid proteins: {len(df)}, allosteric: {df['label'].sum()}, orthosteric: {len(df)-df['label'].sum()}")
-    return df
-
-def split_by_protein(df, val_split, test_split, seed):
-    proteins = df['pdb_id'].unique()
-    train_val, test = train_test_split(proteins, test_size=test_split, random_state=seed)
-    train, val = train_test_split(train_val, test_size=val_split/(1-test_split), random_state=seed)
-    df['split'] = 'train'
-    df.loc[df['pdb_id'].isin(val), 'split'] = 'val'
-    df.loc[df['pdb_id'].isin(test), 'split'] = 'test'
-    for s in ['train', 'val', 'test']:
-        sub = df[df['split'] == s]
-        logger.info(f"{s}: {len(sub)} proteins, allosteric ratio={sub['label'].mean():.2%}")
     return df
 
 def compute_agg_dim_and_keys(pkl_path):
@@ -813,7 +802,17 @@ def run_experiment(run_id, args, df, loss_mask):
     with open(os.path.join(run_save_dir, 'ablation_config.json'), 'w') as f:
         json.dump(ablation_config, f, indent=2)
 
-    df_run = split_by_protein(df.copy(), args.val_split, args.test_split, run_seed)
+    # Use predefined split column directly
+    df_run = df.copy()
+    if 'split' not in df_run.columns:
+        logger.error("df does not have 'split' column. Please provide predefined splits.")
+        raise ValueError("Missing split column")
+
+    # Print split statistics
+    for s in ['train', 'val', 'test']:
+        sub = df_run[df_run['split'] == s]
+        logger.info(f"[Run {run_id+1}] {s}: {len(sub)} proteins, allosteric ratio={sub['label'].mean():.2%}")
+
     train_df = df_run[df_run['split'] == 'train']
 
     # Infer aggregation feature dimension (if needed)
@@ -952,6 +951,40 @@ def main():
     if df.empty:
         logger.error("No valid samples found, exiting.")
         sys.exit(1)
+
+    # ---------- Load predefined splits ----------
+    split_dir = args.split_dir
+    train_ids_file = os.path.join(split_dir, 'train_pdb_ids.txt')
+    val_ids_file = os.path.join(split_dir, 'val_pdb_ids.txt')
+    test_ids_file = os.path.join(split_dir, 'test_pdb_ids.txt')
+
+    if not (os.path.exists(train_ids_file) and os.path.exists(val_ids_file) and os.path.exists(test_ids_file)):
+        logger.error(f"Predefined split files not found in {split_dir}. Please run the split script first.")
+        sys.exit(1)
+
+    with open(train_ids_file) as f:
+        train_ids = set(line.strip() for line in f if line.strip())
+    with open(val_ids_file) as f:
+        val_ids = set(line.strip() for line in f if line.strip())
+    with open(test_ids_file) as f:
+        test_ids = set(line.strip() for line in f if line.strip())
+
+    # Check for unassigned proteins
+    all_ids = set(df['pdb_id'].unique())
+    assigned_ids = train_ids | val_ids | test_ids
+    unassigned = all_ids - assigned_ids
+    if unassigned:
+        logger.warning(f"{len(unassigned)} proteins not in any split. They will be assigned to train.")
+        train_ids.update(unassigned)
+
+    df['split'] = 'train'
+    df.loc[df['pdb_id'].isin(val_ids), 'split'] = 'val'
+    df.loc[df['pdb_id'].isin(test_ids), 'split'] = 'test'
+
+    # Print predefined split statistics
+    for s in ['train', 'val', 'test']:
+        sub = df[df['split'] == s]
+        logger.info(f"Predefined split {s}: {len(sub)} proteins, allosteric ratio={sub['label'].mean():.2%}")
 
     all_results = []
     for run_id in range(args.n_runs):

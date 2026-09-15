@@ -60,6 +60,9 @@ def parse_args():
     parser.add_argument('--num_workers', type=int, default=0)
     parser.add_argument('--save_dir', type=str, default='./Model_File/residue_v4_4_chain_exp')
     parser.add_argument('--use_amp', action='store_true')
+    # New: directory for predefined splits
+    parser.add_argument('--split_dir', type=str, default='./data_splits',
+                        help='Directory containing train_pdb_ids.txt, val_pdb_ids.txt, test_pdb_ids.txt')
     return parser.parse_args()
 
 try:
@@ -132,6 +135,7 @@ def collect_proteins(pos_dir, neg_dir):
     logger.info(f"Total valid proteins: {len(df)}, allosteric: {df['label'].sum()}, orthosteric: {len(df)-df['label'].sum()}")
     return df
 
+# Note: split_by_protein is no longer used, kept for compatibility
 def split_by_protein(df, val_split, test_split, seed):
     proteins = df['pdb_id'].unique()
     train_val, test = train_test_split(proteins, test_size=test_split, random_state=seed)
@@ -716,7 +720,16 @@ def run_experiment(run_id, args, df):
     run_save_dir = os.path.join(args.save_dir, f'run{run_id+1}')
     os.makedirs(run_save_dir, exist_ok=True)
 
-    df_run = split_by_protein(df.copy(), args.val_split, args.test_split, run_seed)
+    # Directly use df with predefined split column, no dynamic splitting
+    df_run = df.copy()
+    if 'split' not in df_run.columns:
+        logger.error("df does not have 'split' column. Please provide predefined splits.")
+        raise ValueError("Missing split column")
+
+    # Print split statistics
+    for s in ['train', 'val', 'test']:
+        sub = df_run[df_run['split'] == s]
+        logger.info(f"[Run {run_id+1}] {s}: {len(sub)} proteins, allosteric ratio={sub['label'].mean():.2%}")
 
     train_ds = ResidueFullGVPDataset(df_run[df_run['split'] == 'train'])
     val_ds = ResidueFullGVPDataset(df_run[df_run['split'] == 'val'])
@@ -775,7 +788,7 @@ def run_experiment(run_id, args, df):
         overall_s = val_metrics['overall_smooth']
         logger.info(f"Val Smooth | AUROC: {overall_s['auroc']:.4f} AUPRC: {overall_s['auprc']:.4f} "
                     f"F1: {overall_s['f1']:.4f} Recall: {overall_s['recall']:.4f} Precision: {overall_s['precision']:.4f}")
-        logger.info(f"Val Per‑Protein (smoothed) | AUPRC avg: {pp_avg['auprc_avg']:.4f} on {pp_avg['num_proteins']} proteins")
+        logger.info(f"Val Per-Protein (smoothed) | AUPRC avg: {pp_avg['auprc_avg']:.4f} on {pp_avg['num_proteins']} proteins")
 
         scheduler.step()
         if swa_model and epoch >= args.swa_start:
@@ -791,7 +804,7 @@ def run_experiment(run_id, args, df):
                 ema.restore()
             else:
                 torch.save(model.state_dict(), os.path.join(run_save_dir, 'best_model.pt'))
-            logger.info(f"Saved best model (per‑protein AUPRC={best_pp_auprc:.4f})")
+            logger.info(f"Saved best model (per-protein AUPRC={best_pp_auprc:.4f})")
         else:
             patience_cnt += 1
             if patience_cnt >= args.patience:
@@ -802,7 +815,7 @@ def run_experiment(run_id, args, df):
     test_metrics = evaluate(model, test_loader, device, ema=None, smooth_sigma=args.smooth_sigma)
     logger.info(f"Test Overall (raw): {json.dumps(test_metrics['overall_raw'], indent=2)}")
     logger.info(f"Test Overall (smooth): {json.dumps(test_metrics['overall_smooth'], indent=2)}")
-    logger.info(f"Test Per‑Protein avg: {json.dumps(test_metrics['per_protein_avg'], indent=2)}")
+    logger.info(f"Test Per-Protein avg: {json.dumps(test_metrics['per_protein_avg'], indent=2)}")
     with open(os.path.join(run_save_dir, 'test_results.json'), 'w') as f:
         json.dump(test_metrics, f, indent=2)
 
@@ -818,6 +831,41 @@ def main():
         logger.error("No valid samples, exiting.")
         sys.exit(1)
 
+    # ---------- Load predefined splits ----------
+    split_dir = args.split_dir
+    train_ids_file = os.path.join(split_dir, 'train_pdb_ids.txt')
+    val_ids_file = os.path.join(split_dir, 'val_pdb_ids.txt')
+    test_ids_file = os.path.join(split_dir, 'test_pdb_ids.txt')
+
+    if not (os.path.exists(train_ids_file) and os.path.exists(val_ids_file) and os.path.exists(test_ids_file)):
+        logger.error(f"Predefined split files not found in {split_dir}. Please run the split script first.")
+        sys.exit(1)
+
+    with open(train_ids_file) as f:
+        train_ids = set(line.strip() for line in f if line.strip())
+    with open(val_ids_file) as f:
+        val_ids = set(line.strip() for line in f if line.strip())
+    with open(test_ids_file) as f:
+        test_ids = set(line.strip() for line in f if line.strip())
+
+    # Check for unassigned proteins
+    all_ids = set(df['pdb_id'].unique())
+    assigned_ids = train_ids | val_ids | test_ids
+    unassigned = all_ids - assigned_ids
+    if unassigned:
+        logger.warning(f"{len(unassigned)} proteins not in any split. They will be assigned to train.")
+        train_ids.update(unassigned)
+
+    df['split'] = 'train'
+    df.loc[df['pdb_id'].isin(val_ids), 'split'] = 'val'
+    df.loc[df['pdb_id'].isin(test_ids), 'split'] = 'test'
+
+    # Print predefined split statistics
+    for s in ['train', 'val', 'test']:
+        sub = df[df['split'] == s]
+        logger.info(f"Predefined split {s}: {len(sub)} proteins, allosteric ratio={sub['label'].mean():.2%}")
+
+    # ---------- Run experiments ----------
     if args.run_id is not None:
         if args.run_id < 0 or args.run_id >= args.n_runs:
             logger.error(f"run_id {args.run_id} out of range 0~{args.n_runs-1}")

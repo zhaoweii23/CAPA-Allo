@@ -9,4 +9,4 @@ This model Training was performed on an NVIDIA H100 80 GB GPU equipped with CUDA
 1. Building Environment: conda env create -f environment.yml
 2. Generate features: python Feature_generate.py It needs to be replaced with the corresponding test file.
 
-3. Model training: python MTLION_main.py
+3. Model training: python main_pocket.py or main_residue.py

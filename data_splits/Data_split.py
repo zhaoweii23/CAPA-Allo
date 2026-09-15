@@ -35,7 +35,7 @@ def collect_proteins(pos_dir, neg_dir):
             if get_protein_esm(feat) is not None:
                 samples.append({'pkl_path': str(pkl_path), 'label': 1})
         except Exception as e:
-            logger.warning(f"读取失败 {pkl_path}: {e}")
+            logger.warning(f"failed {pkl_path}: {e}")
     for pkl_path in Path(neg_dir).glob("*_features.pkl"):
         try:
             with open(pkl_path, 'rb') as f:
@@ -43,7 +43,7 @@ def collect_proteins(pos_dir, neg_dir):
             if get_protein_esm(feat) is not None:
                 samples.append({'pkl_path': str(pkl_path), 'label': 0})
         except Exception as e:
-            logger.warning(f"读取失败 {pkl_path}: {e}")
+            logger.warning(f"failed {pkl_path}: {e}")
     df = pd.DataFrame(samples)
     if df.empty:
         return df
@@ -70,7 +70,7 @@ def main():
     logger = setup_logging(args.save_dir)
     df = collect_proteins(args.pos_dir, args.neg_dir)
     if df.empty:
-        logger.error("无有效样本")
+        logger.error("no file")
         return
     train_ids, val_ids, test_ids = split_by_protein(df, args.val_split, args.test_split, args.seed)
     for name, ids in [('train', train_ids), ('val', val_ids), ('test', test_ids)]:
@@ -78,7 +78,7 @@ def main():
         with open(path, 'w') as f:
             f.write('\n'.join(ids))
         logger.info(f"{name}: {len(ids)} proteins, saved to {path}")
-    # 打印每个split的变构比例
+  
     for name, ids in [('train', train_ids), ('val', val_ids), ('test', test_ids)]:
         sub = df[df['pdb_id'].isin(ids)]
         ratio = sub['label'].mean()

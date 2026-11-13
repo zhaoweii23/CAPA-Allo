@@ -100,7 +100,6 @@ def get_chain_lengths(pdb_file, chain_ids):
 
 
 def evaluate(probs, known_indices, threshold=0.5, top_k=50):
-    """计算多种评估指标。"""
     if len(probs) == 0 or len(known_indices) == 0:
         return None
 
@@ -189,10 +188,7 @@ def permutation_test_topk_recall(probs, known_indices, top_k=TOP_K,
     return observed, p_value, z_score, null_dist
 
 
-# ================== 可视化 ==================
-
 def write_known_site_pdb(apo_pdb, global_indices, output_pdb):
-    """生成已知位点标记 PDB（B 因子=100）。"""
     parser = PDBParser(QUIET=True)
     structure = parser.get_structure('apo', apo_pdb)
     all_residues = []

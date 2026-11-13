@@ -1,4 +1,18 @@
 #!/usr/bin/env python3
+"""
+AlloGator (Residue) main training script.
+
+Full configuration:
+  - Chain-aware positional encoding + chain-aware attention mask
+  - Cross-chain aggregator for multimeric proteins
+  - Gated fusion of ESM-2 and GVP geometric features
+  - Pocket-aware cross-attention with learnable pocket query
+  - Five losses: BCE(pos_weight), Dice, SupCon, InfoNCE, R-Drop
+  - EMA of model weights
+  - Predefined protein-level splits from --split_dir
+  - Raw (non-smoothed) probability evaluation
+"""
+
 import os, sys, argparse, pickle, logging, json, math
 from pathlib import Path
 import numpy as np
@@ -10,27 +24,33 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-from torch.optim.swa_utils import AveragedModel, SWALR
 from sklearn.metrics import (
     roc_auc_score, average_precision_score, f1_score,
     recall_score, precision_score, accuracy_score, matthews_corrcoef
 )
-from sklearn.model_selection import train_test_split
-from scipy.ndimage import gaussian_filter1d
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s',
                     handlers=[logging.FileHandler('residue_v4_4_chain.log'), logging.StreamHandler()])
 logger = logging.getLogger(__name__)
 
+
+# ==================== Argument parsing ====================
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--pos_dir', type=str, default='./data/processed/features_allosteric_pkl_saprot_0611')
     parser.add_argument('--neg_dir', type=str, default='./data/processed/features_orthostic_pkl_saprot_0611')
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--n_runs', type=int, default=5)
+    parser.add_argument('--run_id', type=int, default=None,
+                        help='Run a specific run (0-based). If None, run all / skip completed.')
+    parser.add_argument('--summary_only', action='store_true', default=False,
+                        help='Skip training and only aggregate existing test_results.json')
+    parser.add_argument('--split_dir', type=str, default='./data_splits',
+                        help='Directory containing train/val/test pdb id lists')
+    # Deprecated: kept for backward compatibility, not used
     parser.add_argument('--val_split', type=float, default=0.15)
     parser.add_argument('--test_split', type=float, default=0.15)
-    parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--n_runs', type=int, default=3)
-    parser.add_argument('--run_id', type=int, default=None, help='run a specific run id (0~n_runs-1), if not specified, run all')
+    # Model hyperparameters
     parser.add_argument('--esm_dim', type=int, default=1280)
     parser.add_argument('--d_model', type=int, default=256)
     parser.add_argument('--nhead', type=int, default=8)
@@ -43,7 +63,7 @@ def parse_args():
     parser.add_argument('--lambda_rdrop', type=float, default=0.1)
     parser.add_argument('--pos_weight', type=float, default=150.0)
     parser.add_argument('--dynamic_pos_weight', action='store_true', default=False)
-    parser.add_argument('--smooth_sigma', type=float, default=2.0)
+    # Training
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--grad_accum', type=int, default=4)
     parser.add_argument('--epochs', type=int, default=200)
@@ -53,17 +73,12 @@ def parse_args():
     parser.add_argument('--patience', type=int, default=20)
     parser.add_argument('--grad_clip', type=float, default=1.0)
     parser.add_argument('--noise_std', type=float, default=0.01)
-    parser.add_argument('--use_swa', action='store_true', default=True)
-    parser.add_argument('--swa_start', type=int, default=30)
-    parser.add_argument('--swa_lr', type=float, default=1e-5)
     parser.add_argument('--device', type=str, default='cuda:1')
     parser.add_argument('--num_workers', type=int, default=0)
     parser.add_argument('--save_dir', type=str, default='./Model_File/residue_v4_4_chain_exp')
     parser.add_argument('--use_amp', action='store_true')
-    # New: directory for predefined splits
-    parser.add_argument('--split_dir', type=str, default='./data_splits',
-                        help='Directory containing train_pdb_ids.txt, val_pdb_ids.txt, test_pdb_ids.txt')
     return parser.parse_args()
+
 
 try:
     import torch
@@ -71,6 +86,8 @@ try:
 except ImportError:
     HAS_TORCH = False
 
+
+# ==================== Utility functions ====================
 def to_tensor(x, dtype=torch.float):
     if isinstance(x, torch.Tensor):
         return x.to(dtype=dtype)
@@ -78,6 +95,7 @@ def to_tensor(x, dtype=torch.float):
         return torch.from_numpy(x).to(dtype=dtype)
     else:
         return torch.tensor(x, dtype=dtype)
+
 
 def recursive_to_cpu(obj):
     if isinstance(obj, dict):
@@ -91,10 +109,12 @@ def recursive_to_cpu(obj):
     else:
         return obj
 
+
 def set_seed(seed):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
 
 def get_protein_esm(feat):
     if feat.get('protein_esm') is not None:
@@ -105,10 +125,12 @@ def get_protein_esm(feat):
             return np.concatenate(segments, axis=0)
     return None
 
+
 def load_pkl_safe(pkl_path):
     with open(pkl_path, 'rb') as f:
         obj = pickle.load(f)
     return recursive_to_cpu(obj)
+
 
 def collect_proteins(pos_dir, neg_dir):
     samples = []
@@ -132,14 +154,16 @@ def collect_proteins(pos_dir, neg_dir):
     if df.empty:
         return df
     df['pdb_id'] = df['pkl_path'].apply(lambda x: Path(x).stem.replace('_features', ''))
-    logger.info(f"Total valid proteins: {len(df)}, allosteric: {df['label'].sum()}, orthosteric: {len(df)-df['label'].sum()}")
+    logger.info(f"Total valid proteins: {len(df)}, allosteric: {df['label'].sum()}, "
+                f"orthosteric: {len(df) - df['label'].sum()}")
     return df
 
-# Note: split_by_protein is no longer used, kept for compatibility
+
 def split_by_protein(df, val_split, test_split, seed):
+    """Deprecated: kept for backward compatibility; the main script uses --split_dir."""
     proteins = df['pdb_id'].unique()
     train_val, test = train_test_split(proteins, test_size=test_split, random_state=seed)
-    train, val = train_test_split(train_val, test_size=val_split/(1-test_split), random_state=seed)
+    train, val = train_test_split(train_val, test_size=val_split / (1 - test_split), random_state=seed)
     df['split'] = 'train'
     df.loc[df['pdb_id'].isin(val), 'split'] = 'val'
     df.loc[df['pdb_id'].isin(test), 'split'] = 'test'
@@ -148,20 +172,25 @@ def split_by_protein(df, val_split, test_split, seed):
         logger.info(f"{s}: {len(sub)} proteins, allosteric ratio={sub['label'].mean():.2%}")
     return df
 
+
+# ==================== Loss functions ====================
 class DiceLoss(nn.Module):
     def __init__(self, smooth=1e-6):
         super().__init__()
         self.smooth = smooth
+
     def forward(self, inputs, targets):
         probs = torch.sigmoid(inputs)
         intersection = (probs * targets).sum()
         dice = (2. * intersection + self.smooth) / (probs.sum() + targets.sum() + self.smooth)
         return 1. - dice
 
+
 class SupConLoss(nn.Module):
     def __init__(self, temperature=0.07):
         super().__init__()
         self.temperature = temperature
+
     def forward(self, features, labels):
         if len(labels) < 2:
             return torch.tensor(0.0, device=features.device)
@@ -173,10 +202,12 @@ class SupConLoss(nn.Module):
         mean_log_prob_pos = (mask * log_prob).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-8)
         return -mean_log_prob_pos.mean()
 
+
 class InfoNCELoss(nn.Module):
     def __init__(self, temperature=0.07):
         super().__init__()
         self.temperature = temperature
+
     def forward(self, residue_feats, global_feats, mask):
         B, L, D = residue_feats.shape
         residue_feats = residue_feats[mask]
@@ -191,10 +222,13 @@ class InfoNCELoss(nn.Module):
         labels = torch.zeros(len(batch_idx), dtype=torch.long, device=residue_feats.device)
         return F.cross_entropy(logits, labels)
 
+
+# ==================== Model components ====================
 class DropPath(nn.Module):
     def __init__(self, drop_prob=0.0):
         super().__init__()
         self.drop_prob = drop_prob
+
     def forward(self, x):
         if self.drop_prob == 0. or not self.training:
             return x
@@ -203,6 +237,7 @@ class DropPath(nn.Module):
         random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
         random_tensor.floor_()
         return x / keep_prob * random_tensor
+
 
 class TransformerEncoderLayerDP(nn.Module):
     def __init__(self, d_model, nhead, dim_feedforward, dropout, drop_path_rate):
@@ -228,6 +263,7 @@ class TransformerEncoderLayerDP(nn.Module):
         x = x + self.drop_path(self.dropout2(ff_out))
         return x
 
+
 class ChainAwarePositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=20000, dropout=0.1):
         super().__init__()
@@ -252,6 +288,7 @@ class ChainAwarePositionalEncoding(nn.Module):
         pos = pos.clamp(0, self.pe.size(0) - 1)
         return self.dropout(x + self.pe[pos])
 
+
 def build_chain_attn_mask(chain_ids, mask, nhead):
     B, L = chain_ids.shape
     valid = mask.unsqueeze(-1) & mask.unsqueeze(-2)
@@ -262,8 +299,10 @@ def build_chain_attn_mask(chain_ids, mask, nhead):
     attn_mask = attn_mask.unsqueeze(1).expand(-1, nhead, -1, -1).reshape(B * nhead, L, L)
     return attn_mask
 
+
 class ChainEncoder(nn.Module):
-    def __init__(self, esm_dim, d_model, nhead, num_layers, dim_feedforward, dropout, drop_path_rate, max_len=20000):
+    def __init__(self, esm_dim, d_model, nhead, num_layers, dim_feedforward, dropout,
+                 drop_path_rate, max_len=20000):
         super().__init__()
         self.proj = nn.Linear(esm_dim, d_model)
         self.pos_enc = ChainAwarePositionalEncoding(d_model, max_len=max_len, dropout=dropout)
@@ -290,6 +329,7 @@ class ChainEncoder(nn.Module):
                 x = layer(x, key_padding_mask, chain_attn_mask)
         x = self.final_norm(x)
         return x
+
 
 class CrossChainAggregator(nn.Module):
     def __init__(self, d_model, num_heads=2, dropout=0.1):
@@ -332,11 +372,11 @@ class CrossChainAggregator(nn.Module):
             output[mask_c] = enhanced[idx]
         return output
 
+
 class CrossAttentionPocket(nn.Module):
     def __init__(self, d_model, nhead=8, dropout=0.1):
         super().__init__()
         self.cross_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
-        self.norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
         self.pocket_query = nn.Parameter(torch.randn(1, 1, d_model))
 
@@ -353,7 +393,8 @@ class CrossAttentionPocket(nn.Module):
             return self.dropout(attn_out), attn_weights
         return self.dropout(attn_out)
 
-class OptimizedModel(nn.Module):
+
+class AlloGatorResidueModel(nn.Module):
     def __init__(self, args, geom_feat_dim):
         super().__init__()
         self.chain_encoder = ChainEncoder(
@@ -418,16 +459,21 @@ class OptimizedModel(nn.Module):
             return logits, proj, global_proj, attn_weights
         return logits, proj, global_proj
 
+
 class AdaptiveLossWeights:
     def __init__(self, device, num_losses=5):
         self.log_vars = nn.ParameterList([
             nn.Parameter(torch.zeros(1, device=device)) for _ in range(num_losses)
         ])
+
     def get_weights(self):
         return [torch.exp(-lv) for lv in self.log_vars]
+
     def parameters(self):
         return list(self.log_vars.parameters())
 
+
+# ==================== Dataset ====================
 class ResidueFullGVPDataset(Dataset):
     def __init__(self, df):
         self.df = df.reset_index(drop=True)
@@ -474,6 +520,7 @@ class ResidueFullGVPDataset(Dataset):
             'chain_ids': chain_ids
         }
 
+
 def collate_varlen(batch):
     pdb_ids = [item['pdb_id'] for item in batch]
     seq_esm_list = [item['seq_esm'] for item in batch]
@@ -508,33 +555,41 @@ def collate_varlen(batch):
         'chain_ids': padded_chain
     }
 
+
+# ==================== EMA ====================
 class EMA:
     def __init__(self, model, decay=0.999):
         self.model = model
         self.decay = decay
-        self.shadow = {name: param.data.clone() for name, param in model.named_parameters() if param.requires_grad}
+        self.shadow = {name: param.data.clone() for name, param in model.named_parameters()
+                       if param.requires_grad}
         self.backup = {}
+
     def update(self):
         for name, param in self.model.named_parameters():
             if param.requires_grad:
-                new_average = self.decay * self.shadow[name] + (1.0 - self.decay) * param.data
-                self.shadow[name] = new_average.clone()
+                self.shadow[name] = (self.decay * self.shadow[name]
+                                     + (1.0 - self.decay) * param.data).clone()
+
     def apply_shadow(self):
         for name, param in self.model.named_parameters():
             if param.requires_grad:
                 self.backup[name] = param.data
                 param.data = self.shadow[name]
+
     def restore(self):
         for name, param in self.model.named_parameters():
             if param.requires_grad:
                 param.data = self.backup[name]
         self.backup = {}
 
+
+# ==================== Training / evaluation ====================
 def train_epoch(model, ema, optimizer, criterion_dice, criterion_cont, criterion_ssl,
                 adaptive_weights, device, grad_clip, args, scaler, loader):
     model.train()
     total_loss = 0.0
-    total_bce = 0.0; total_dice = 0.0; total_cont = 0.0; total_ssl = 0.0; total_rdrop = 0.0
+    total_bce = total_dice = total_cont = total_ssl = total_rdrop = 0.0
 
     optimizer.zero_grad()
     for i, batch in enumerate(tqdm(loader, desc='Train', leave=False)):
@@ -548,7 +603,7 @@ def train_epoch(model, ema, optimizer, criterion_dice, criterion_cont, criterion
             seq_esm_aug = seq_esm + torch.randn_like(seq_esm) * args.noise_std * mask.unsqueeze(-1)
             geom_feat_aug = geom_feat + torch.randn_like(geom_feat) * args.noise_std * mask.unsqueeze(-1)
         else:
-            seq_esm_aug = seq_esm; geom_feat_aug = geom_feat
+            seq_esm_aug, geom_feat_aug = seq_esm, geom_feat
 
         with torch.amp.autocast('cuda', enabled=scaler is not None):
             logits1, proj1, global_proj1 = model(seq_esm, mask, geom_feat, chain_ids)
@@ -622,15 +677,17 @@ def train_epoch(model, ema, optimizer, criterion_dice, criterion_cont, criterion
     n = len(loader)
     logger.info(f"Loss weights: bce={weights[0].item():.3f}, dice={weights[1].item():.3f}, "
                 f"cont={weights[2].item():.3f}, ssl={weights[3].item():.3f}, rdrop={weights[4].item():.3f}")
-    return (total_loss/n, total_bce/n, total_dice/n, total_cont/n, total_ssl/n, total_rdrop/n)
+    return (total_loss / n, total_bce / n, total_dice / n, total_cont / n, total_ssl / n, total_rdrop / n)
+
 
 @torch.no_grad()
-def evaluate(model, loader, device, ema=None, smooth_sigma=2.0):
+def evaluate(model, loader, device, ema=None):
     if ema is not None:
         ema.apply_shadow()
     model.eval()
-    all_labels, all_probs_raw, all_probs_smooth = [], [], []
-    per_protein_probs_raw, per_protein_labels = [], []
+
+    all_labels, all_probs = [], []
+    per_protein_probs, per_protein_labels = [], []
     pdb_ids_list = []
 
     for batch in tqdm(loader, desc='Eval', leave=False):
@@ -645,21 +702,13 @@ def evaluate(model, loader, device, ema=None, smooth_sigma=2.0):
         probs = torch.sigmoid(logits)
 
         for i in range(len(batch['protein_labels'])):
-            valid = mask[i].sum()
-            if valid == 0:
+            if mask[i].sum() == 0:
                 continue
-            p_raw = probs[i][mask[i]].cpu().numpy()
+            p = probs[i][mask[i]].cpu().numpy()
             l = labels[i][mask[i]].cpu().numpy()
-
-            if smooth_sigma > 0 and len(p_raw) > 3:
-                p_smooth = gaussian_filter1d(p_raw, sigma=smooth_sigma)
-            else:
-                p_smooth = p_raw
-
-            all_probs_raw.append(p_raw)
-            all_probs_smooth.append(p_smooth)
+            all_probs.append(p)
             all_labels.append(l)
-            per_protein_probs_raw.append(p_smooth)
+            per_protein_probs.append(p)
             per_protein_labels.append(l)
             pdb_ids_list.append(pdb_ids[i])
 
@@ -678,15 +727,11 @@ def evaluate(model, loader, device, ema=None, smooth_sigma=2.0):
             'mcc': matthews_corrcoef(y_true, pred_binary)
         }
 
-    overall_raw = compute_metrics(np.concatenate(all_labels),
-                                  np.concatenate(all_probs_raw))
-    overall_raw['count'] = sum(len(a) for a in all_labels)
-    overall_smooth = compute_metrics(np.concatenate(all_labels),
-                                     np.concatenate(all_probs_smooth))
-    overall_smooth['count'] = overall_raw['count']
+    overall = compute_metrics(np.concatenate(all_labels), np.concatenate(all_probs))
+    overall['count'] = int(sum(len(a) for a in all_labels))
 
     per_protein_metrics = []
-    for yt, yp, pid in zip(per_protein_labels, per_protein_probs_raw, pdb_ids_list):
+    for yt, yp, pid in zip(per_protein_labels, per_protein_probs, pdb_ids_list):
         if len(np.unique(yt)) < 2:
             continue
         m = compute_metrics(yt, yp)
@@ -695,82 +740,74 @@ def evaluate(model, loader, device, ema=None, smooth_sigma=2.0):
 
     if per_protein_metrics:
         pp_avg = {
-            'auroc_avg': np.mean([m['auroc'] for m in per_protein_metrics]),
-            'auprc_avg': np.mean([m['auprc'] for m in per_protein_metrics]),
-            'f1_avg': np.mean([m['f1'] for m in per_protein_metrics]),
-            'mcc_avg': np.mean([m['mcc'] for m in per_protein_metrics]),
-            'num_proteins': len(per_protein_metrics)
+            'auroc_avg': float(np.mean([m['auroc'] for m in per_protein_metrics])),
+            'auprc_avg': float(np.mean([m['auprc'] for m in per_protein_metrics])),
+            'f1_avg': float(np.mean([m['f1'] for m in per_protein_metrics])),
+            'mcc_avg': float(np.mean([m['mcc'] for m in per_protein_metrics])),
+            'num_proteins': int(len(per_protein_metrics))
         }
     else:
         pp_avg = {'auroc_avg': 0.0, 'auprc_avg': 0.0, 'f1_avg': 0.0, 'mcc_avg': 0.0, 'num_proteins': 0}
 
-    result = {
-        'overall_raw': overall_raw,
-        'overall_smooth': overall_smooth,
-        'per_protein_avg': pp_avg
-    }
+    result = {'overall': overall, 'per_protein_avg': pp_avg}
 
     if ema is not None:
         ema.restore()
     return result
 
+
+# ==================== Single run ====================
 def run_experiment(run_id, args, df):
     run_seed = args.seed + run_id
     set_seed(run_seed)
     run_save_dir = os.path.join(args.save_dir, f'run{run_id+1}')
     os.makedirs(run_save_dir, exist_ok=True)
 
-    # Directly use df with predefined split column, no dynamic splitting
     df_run = df.copy()
     if 'split' not in df_run.columns:
-        logger.error("df does not have 'split' column. Please provide predefined splits.")
+        logger.error("df does not have 'split' column. Predefined splits required.")
         raise ValueError("Missing split column")
 
-    # Print split statistics
     for s in ['train', 'val', 'test']:
         sub = df_run[df_run['split'] == s]
-        logger.info(f"[Run {run_id+1}] {s}: {len(sub)} proteins, allosteric ratio={sub['label'].mean():.2%}")
+        logger.info(f"[Run {run_id+1}] {s}: {len(sub)} proteins, "
+                    f"allosteric ratio={sub['label'].mean():.2%}")
 
     train_ds = ResidueFullGVPDataset(df_run[df_run['split'] == 'train'])
     val_ds = ResidueFullGVPDataset(df_run[df_run['split'] == 'val'])
     test_ds = ResidueFullGVPDataset(df_run[df_run['split'] == 'test'])
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                              collate_fn=collate_varlen, num_workers=0, pin_memory=False)
+                              collate_fn=collate_varlen, num_workers=args.num_workers, pin_memory=False)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
-                            collate_fn=collate_varlen, num_workers=0, pin_memory=False)
+                            collate_fn=collate_varlen, num_workers=args.num_workers, pin_memory=False)
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
-                             collate_fn=collate_varlen, num_workers=0, pin_memory=False)
+                             collate_fn=collate_varlen, num_workers=args.num_workers, pin_memory=False)
 
     sample_batch = next(iter(train_loader))
     actual_geom_dim = sample_batch['geom_feat'].size(-1)
     logger.info(f"[Run {run_id+1}] Geometry feature dimension: {actual_geom_dim}")
 
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
-    model = OptimizedModel(args, geom_feat_dim=actual_geom_dim).to(device)
-    ema = EMA(model, decay=0.999) if args.use_swa else None
+    model = AlloGatorResidueModel(args, geom_feat_dim=actual_geom_dim).to(device)
+    ema = EMA(model, decay=0.999)
 
     criterion_dice = DiceLoss()
     criterion_cont = SupConLoss(temperature=args.temperature)
     criterion_ssl = InfoNCELoss(temperature=args.temperature)
 
     adaptive_weights = AdaptiveLossWeights(device, num_losses=5)
-
     optimizer = AdamW([
         {'params': model.parameters()},
         {'params': adaptive_weights.parameters()}
     ], lr=args.lr, weight_decay=args.weight_decay)
 
-    total_steps = len(train_loader) * args.epochs // args.grad_accum
-    warmup_steps = len(train_loader) * args.warmup_epochs // args.grad_accum
-    scheduler_cos = CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps)
+    total_steps = max(1, len(train_loader) * args.epochs // args.grad_accum)
+    warmup_steps = max(1, len(train_loader) * args.warmup_epochs // args.grad_accum)
+    scheduler_cos = CosineAnnealingLR(optimizer, T_max=max(1, total_steps - warmup_steps))
     scheduler_warm = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_steps)
-    scheduler = SequentialLR(optimizer, schedulers=[scheduler_warm, scheduler_cos], milestones=[warmup_steps])
-
-    swa_model, swa_scheduler = None, None
-    if args.use_swa:
-        swa_model = AveragedModel(model)
-        swa_scheduler = SWALR(optimizer, swa_lr=args.swa_lr)
+    scheduler = SequentialLR(optimizer, schedulers=[scheduler_warm, scheduler_cos],
+                             milestones=[warmup_steps])
 
     scaler = torch.amp.GradScaler('cuda') if args.use_amp else None
     best_pp_auprc = 0.0
@@ -779,48 +816,49 @@ def run_experiment(run_id, args, df):
     for epoch in range(1, args.epochs + 1):
         logger.info(f"[Run {run_id+1}] Epoch {epoch}/{args.epochs}")
         loss_vals = train_epoch(model, ema, optimizer, criterion_dice, criterion_cont,
-                                criterion_ssl, adaptive_weights, device, args.grad_clip, args, scaler, train_loader)
+                                criterion_ssl, adaptive_weights, device, args.grad_clip,
+                                args, scaler, train_loader)
         train_loss, bce, dice, cont, ssl, rdrop = loss_vals
-        logger.info(f"Train Loss: {train_loss:.4f} (bce={bce:.4f}, dice={dice:.4f}, cont={cont:.4f}, ssl={ssl:.4f}, rdrop={rdrop:.4f})")
+        logger.info(f"Train Loss: {train_loss:.4f} (bce={bce:.4f}, dice={dice:.4f}, "
+                    f"cont={cont:.4f}, ssl={ssl:.4f}, rdrop={rdrop:.4f})")
 
-        val_metrics = evaluate(model, val_loader, device, ema=ema, smooth_sigma=args.smooth_sigma)
+        val_metrics = evaluate(model, val_loader, device, ema=ema)
+        overall_v = val_metrics['overall']
         pp_avg = val_metrics['per_protein_avg']
-        overall_s = val_metrics['overall_smooth']
-        logger.info(f"Val Smooth | AUROC: {overall_s['auroc']:.4f} AUPRC: {overall_s['auprc']:.4f} "
-                    f"F1: {overall_s['f1']:.4f} Recall: {overall_s['recall']:.4f} Precision: {overall_s['precision']:.4f}")
-        logger.info(f"Val Per-Protein (smoothed) | AUPRC avg: {pp_avg['auprc_avg']:.4f} on {pp_avg['num_proteins']} proteins")
+        logger.info(f"Val | AUROC: {overall_v['auroc']:.4f} AUPRC: {overall_v['auprc']:.4f} "
+                    f"F1: {overall_v['f1']:.4f} Recall: {overall_v['recall']:.4f} "
+                    f"Precision: {overall_v['precision']:.4f}")
+        logger.info(f"Val Per-Protein | AUPRC avg: {pp_avg['auprc_avg']:.4f} "
+                    f"on {pp_avg['num_proteins']} proteins")
 
         scheduler.step()
-        if swa_model and epoch >= args.swa_start:
-            swa_model.update_parameters(model)
-            swa_scheduler.step()
 
         if pp_avg['auprc_avg'] > best_pp_auprc:
             best_pp_auprc = pp_avg['auprc_avg']
             patience_cnt = 0
-            if ema:
-                ema.apply_shadow()
-                torch.save(model.state_dict(), os.path.join(run_save_dir, 'best_model.pt'))
-                ema.restore()
-            else:
-                torch.save(model.state_dict(), os.path.join(run_save_dir, 'best_model.pt'))
+            ema.apply_shadow()
+            torch.save(model.state_dict(), os.path.join(run_save_dir, 'best_model.pt'))
+            ema.restore()
             logger.info(f"Saved best model (per-protein AUPRC={best_pp_auprc:.4f})")
         else:
             patience_cnt += 1
             if patience_cnt >= args.patience:
-                logger.info("Early stopping triggered.")
+                logger.info("Early stopping")
                 break
 
     model.load_state_dict(torch.load(os.path.join(run_save_dir, 'best_model.pt'), map_location=device))
-    test_metrics = evaluate(model, test_loader, device, ema=None, smooth_sigma=args.smooth_sigma)
-    logger.info(f"Test Overall (raw): {json.dumps(test_metrics['overall_raw'], indent=2)}")
-    logger.info(f"Test Overall (smooth): {json.dumps(test_metrics['overall_smooth'], indent=2)}")
+    logger.info(f"[Run {run_id+1}] Loaded best model.")
+
+    test_metrics = evaluate(model, test_loader, device, ema=None)
+    logger.info(f"Test Overall: {json.dumps(test_metrics['overall'], indent=2)}")
     logger.info(f"Test Per-Protein avg: {json.dumps(test_metrics['per_protein_avg'], indent=2)}")
     with open(os.path.join(run_save_dir, 'test_results.json'), 'w') as f:
         json.dump(test_metrics, f, indent=2)
 
-    return {'run': run_id+1, 'test': test_metrics}
+    return {'run': run_id + 1, 'test': test_metrics}
 
+
+# ==================== Main ====================
 def main():
     args = parse_args()
     set_seed(args.seed)
@@ -831,14 +869,13 @@ def main():
         logger.error("No valid samples, exiting.")
         sys.exit(1)
 
-    # ---------- Load predefined splits ----------
-    split_dir = args.split_dir
-    train_ids_file = os.path.join(split_dir, 'train_pdb_ids.txt')
-    val_ids_file = os.path.join(split_dir, 'val_pdb_ids.txt')
-    test_ids_file = os.path.join(split_dir, 'test_pdb_ids.txt')
-
-    if not (os.path.exists(train_ids_file) and os.path.exists(val_ids_file) and os.path.exists(test_ids_file)):
-        logger.error(f"Predefined split files not found in {split_dir}. Please run the split script first.")
+    train_ids_file = os.path.join(args.split_dir, 'train_pdb_ids.txt')
+    val_ids_file = os.path.join(args.split_dir, 'val_pdb_ids.txt')
+    test_ids_file = os.path.join(args.split_dir, 'test_pdb_ids.txt')
+    if not (os.path.exists(train_ids_file) and os.path.exists(val_ids_file)
+            and os.path.exists(test_ids_file)):
+        logger.error(f"Predefined split files not found in {args.split_dir}. "
+                     f"Please run the split script first.")
         sys.exit(1)
 
     with open(train_ids_file) as f:
@@ -848,64 +885,93 @@ def main():
     with open(test_ids_file) as f:
         test_ids = set(line.strip() for line in f if line.strip())
 
-    # Check for unassigned proteins
     all_ids = set(df['pdb_id'].unique())
-    assigned_ids = train_ids | val_ids | test_ids
-    unassigned = all_ids - assigned_ids
+    unassigned = all_ids - (train_ids | val_ids | test_ids)
     if unassigned:
-        logger.warning(f"{len(unassigned)} proteins not in any split. They will be assigned to train.")
+        logger.warning(f"{len(unassigned)} proteins not in any split. Adding to train.")
         train_ids.update(unassigned)
 
     df['split'] = 'train'
     df.loc[df['pdb_id'].isin(val_ids), 'split'] = 'val'
     df.loc[df['pdb_id'].isin(test_ids), 'split'] = 'test'
 
-    # Print predefined split statistics
     for s in ['train', 'val', 'test']:
         sub = df[df['split'] == s]
-        logger.info(f"Predefined split {s}: {len(sub)} proteins, allosteric ratio={sub['label'].mean():.2%}")
+        logger.info(f"Predefined split {s}: {len(sub)} proteins, "
+                    f"allosteric ratio={sub['label'].mean():.2%}")
 
-    # ---------- Run experiments ----------
+    # Single-run mode
     if args.run_id is not None:
         if args.run_id < 0 or args.run_id >= args.n_runs:
             logger.error(f"run_id {args.run_id} out of range 0~{args.n_runs-1}")
             sys.exit(1)
-        logger.info(f"Single run mode: running experiment {args.run_id+1}")
-        result = run_experiment(args.run_id, args, df)
-        logger.info(f"Run {args.run_id+1} completed, test results saved in {args.save_dir}/run{args.run_id+1}/")
+        logger.info(f"Single run mode: running experiment {args.run_id+1} "
+                    f"(seed={args.seed + args.run_id})")
+        run_experiment(args.run_id, args, df)
+        logger.info(f"Run {args.run_id+1} completed, results saved in "
+                    f"{args.save_dir}/run{args.run_id+1}/")
         return
 
-    completed_runs = []
-    for r in range(args.n_runs):
-        run_dir = os.path.join(args.save_dir, f'run{r+1}')
-        if os.path.exists(os.path.join(run_dir, 'test_results.json')):
-            completed_runs.append(r)
-    unfinished_runs = [r for r in range(args.n_runs) if r not in completed_runs]
-    logger.info(f"Completed runs: {completed_runs}, pending: {unfinished_runs}")
+    # Multi-run mode: skip completed, aggregate all available
+    if args.summary_only:
+        logger.info("summary_only mode: skip training, aggregate existing results")
+        unfinished_runs = []
+    else:
+        completed_runs = []
+        for r in range(args.n_runs):
+            path = os.path.join(args.save_dir, f'run{r+1}', 'test_results.json')
+            if os.path.exists(path):
+                completed_runs.append(r)
+        unfinished_runs = [r for r in range(args.n_runs) if r not in completed_runs]
+        logger.info(f"Completed runs: {completed_runs}, pending: {unfinished_runs}")
 
-    all_results = []
-    for r in completed_runs:
-        with open(os.path.join(args.save_dir, f'run{r+1}', 'test_results.json'), 'r') as f:
-            results = json.load(f)
-            all_results.append({'run': r+1, 'test': results})
     for r in unfinished_runs:
+        logger.info(f"\n{'='*60}\nStarting Run {r+1}/{args.n_runs}\n{'='*60}")
         try:
-            result = run_experiment(r, args, df)
-            all_results.append(result)
+            run_experiment(r, args, df)
         except Exception as e:
             logger.error(f"Run {r+1} failed: {e}")
 
-    all_results = sorted(all_results, key=lambda x: x['run'])
+    all_results = []
+    for r in range(args.n_runs):
+        path = os.path.join(args.save_dir, f'run{r+1}', 'test_results.json')
+        if os.path.exists(path):
+            with open(path) as f:
+                all_results.append({'run': r + 1, 'test': json.load(f)})
+        else:
+            logger.warning(f"run{r+1} missing test_results.json, excluded from summary")
+
+    if not all_results:
+        logger.error("No results available for summary.")
+        sys.exit(1)
+    logger.info(f"Aggregating {len(all_results)} runs")
+
+    def _mean_std(values):
+        values = [float(v) for v in values]
+        mean = float(np.mean(values))
+        std = float(np.std(values, ddof=1)) if len(values) > 1 else 0.0
+        return {'mean': mean, 'std': std}
+
     summary_metrics = ['auroc', 'auprc', 'f1', 'recall', 'precision', 'acc', 'mcc']
+    pp_metrics = ['auroc_avg', 'auprc_avg', 'f1_avg', 'mcc_avg']
+
     summary = {
         'n_runs': args.n_runs,
-        'overall_raw': {m: np.mean([r['test']['overall_raw'][m] for r in all_results]) for m in summary_metrics},
-        'overall_smooth': {m: np.mean([r['test']['overall_smooth'][m] for r in all_results]) for m in summary_metrics},
-        'per_protein_avg': {m: np.mean([r['test']['per_protein_avg'][m] for r in all_results]) for m in ['auroc_avg','auprc_avg','f1_avg','mcc_avg','num_proteins']}
+        'n_summarized_runs': len(all_results),
+        'base_seed': args.seed,
+        'overall': {
+            m: _mean_std([r['test']['overall'][m] for r in all_results]) for m in summary_metrics
+        },
+        'per_protein_avg': {
+            m: _mean_std([r['test']['per_protein_avg'][m] for r in all_results]) for m in pp_metrics
+        }
     }
+
     with open(os.path.join(args.save_dir, 'summary.json'), 'w') as f:
         json.dump(summary, f, indent=2)
-    logger.info(f"Summary completed:\n{json.dumps(summary, indent=2)}")
+    logger.info(f"Summary saved to {args.save_dir}/summary.json")
+    logger.info(json.dumps(summary, indent=2))
+
 
 if __name__ == '__main__':
     main()

@@ -1,0 +1,66 @@
+# Random Seeds
+
+All reported experiments use a base seed of **42**. Each parallel run `r`
+(1-indexed) uses `seed = 42 + (r - 1)`, i.e. run1→42, run2→43, run3→44,
+run4→45, run5→46. The same value is passed to `numpy.random.seed`,
+`torch.manual_seed`, and `torch.cuda.manual_seed_all`, and is also used as
+`random_state` / `RandomState` for data splitting and negative-residue
+sampling.
+
+## Data splits
+
+Predefined protein-level splits are stored in `data_splits/`:
+
+- `train_pdb_ids.txt`
+- `val_pdb_ids.txt`
+- `test_pdb_ids.txt`
+
+These files were generated once with seed **42** (`train_test_split` on the
+unique PDB IDs, `test_size=0.15`, then `val_size=0.15/0.85` of the remaining)
+and are shared by all runs and all ablation variants, so that differences
+between runs reflect model initialization / stochastic training rather than
+different data.
+
+For scripts that split internally (e.g. `residue_v4_4_chain.py`,
+`residue_v4_4_chain_multchain.py`, `cnn_*.py`, `ml_residue_baselines*.py`,
+`pocket_benchmark*.py`), the split seed equals the run seed (`42 + run_id`).
+
+## Per-run seeds
+
+| Run | run_id | seed | Data split seed | Init / training seed |
+|-----|--------|------|-----------------|----------------------|
+| run1 | 0 | 42 | 42 | 42 |
+| run2 | 1 | 43 | 43 | 43 |
+| run3 | 2 | 44 | 44 | 44 |
+| run4 | 3 | 45 | 45 | 45 |
+| run5 | 4 | 46 | 46 | 46 |
+
+## Other stochastic components
+
+- Negative-residue sampling in ML baselines: `np.random.RandomState(seed)`
+  with `seed = 42 + run_id`.
+- Data augmentation (Gaussian noise on ESM-2 / geometric features):
+  `torch.randn_like` under the run seed.
+- DropPath / Dropout: under the run seed.
+- Model initialization: PyTorch default init under the run seed.
+
+## Reproducing
+
+```bash
+# main model, 5 runs
+python residue_v4_4_chain.py --n_runs 5 --seed 42 --split_dir ./data_splits
+
+# multi-chain variant, 5 runs
+python residue_v4_4_chain_multchain.py --n_runs 5 --seed 42 --split_dir ./data_splits
+
+# 1D CNN baseline, 5 runs
+python cnn_residue.py --n_runs 5 --seed 42
+
+# ML baselines, 5 runs
+python ml_residue_baselines_extended.py --n_runs 5 --seed 42
+
+# pocket benchmark, 5 runs
+python pocket_benchmark.py --n_runs 5 --seed 42
+
+# ablation (baseline group), 3 runs
+python residue_ablation.py --n_runs 5 --seed 42 --split_dir ./data_splits

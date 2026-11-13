@@ -27,13 +27,13 @@ For scripts that split internally (e.g. `residue_v4_4_chain.py`,
 
 ## Per-run seeds
 
-| Run | run_id | seed | Data split seed | Init / training seed |
-|-----|--------|------|-----------------|----------------------|
-| run1 | 0 | 42 | 42 | 42 |
-| run2 | 1 | 43 | 43 | 43 |
-| run3 | 2 | 44 | 44 | 44 |
-| run4 | 3 | 45 | 45 | 45 |
-| run5 | 4 | 46 | 46 | 46 |
+| Run | run_id | seed | Data split seed |
+|-----|--------|------|-----------------|
+| run1 | 0 | 42 | 42 |
+| run2 | 1 | 43 | 43 |
+| run3 | 2 | 44 | 44 |
+| run4 | 3 | 45 | 45 | 
+| run5 | 4 | 46 | 46 |
 
 ## Other stochastic components
 
@@ -48,19 +48,9 @@ For scripts that split internally (e.g. `residue_v4_4_chain.py`,
 
 ```bash
 # main model, 5 runs
-python residue_v4_4_chain.py --n_runs 5 --seed 42 --split_dir ./data_splits
+python main_residue.py --n_runs 5 --seed 42
 
-# multi-chain variant, 5 runs
-python residue_v4_4_chain_multchain.py --n_runs 5 --seed 42 --split_dir ./data_splits
-
-# 1D CNN baseline, 5 runs
-python cnn_residue.py --n_runs 5 --seed 42
-
-# ML baselines, 5 runs
-python ml_residue_baselines_extended.py --n_runs 5 --seed 42
 
 # pocket benchmark, 5 runs
-python pocket_benchmark.py --n_runs 5 --seed 42
+python main_pocket.py --n_runs 5 --seed 42
 
-# ablation (baseline group), 3 runs
-python residue_ablation.py --n_runs 5 --seed 42 --split_dir ./data_splits

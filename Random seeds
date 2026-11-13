@@ -21,9 +21,6 @@ and are shared by all runs and all ablation variants, so that differences
 between runs reflect model initialization / stochastic training rather than
 different data.
 
-For scripts that split internally (e.g. `residue_v4_4_chain.py`,
-`residue_v4_4_chain_multchain.py`, `cnn_*.py`, `ml_residue_baselines*.py`,
-`pocket_benchmark*.py`), the split seed equals the run seed (`42 + run_id`).
 
 ## Per-run seeds
 

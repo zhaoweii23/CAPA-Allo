@@ -1,17 +1,4 @@
 #!/usr/bin/env python3
-"""
-AlloGator (Residue) main training script.
-
-Full configuration:
-  - Chain-aware positional encoding + chain-aware attention mask
-  - Cross-chain aggregator for multimeric proteins
-  - Gated fusion of ESM-2 and GVP geometric features
-  - Pocket-aware cross-attention with learnable pocket query
-  - Five losses: BCE(pos_weight), Dice, SupCon, InfoNCE, R-Drop
-  - EMA of model weights
-  - Predefined protein-level splits from --split_dir
-  - Raw (non-smoothed) probability evaluation
-"""
 
 import os, sys, argparse, pickle, logging, json, math
 from pathlib import Path

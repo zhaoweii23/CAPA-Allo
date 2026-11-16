@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
+from sklearn.model_selection import train_test_split
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from sklearn.metrics import (
     roc_auc_score, average_precision_score, f1_score,
@@ -50,10 +51,8 @@ def parse_args():
     parser.add_argument('--lambda_rdrop', type=float, default=0.1)
     parser.add_argument('--pos_weight', type=float, default=150.0)
     parser.add_argument('--dynamic_pos_weight', action='store_true', default=False)
-    # SupCon sampling upper bound (prevents O(L^2) blow-up on long proteins)
     parser.add_argument('--supcon_max_n', type=int, default=2000,
                         help='Max number of residues fed into SupCon per protein (0 = no limit)')
-    # Training
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--grad_accum', type=int, default=4)
     parser.add_argument('--epochs', type=int, default=200)

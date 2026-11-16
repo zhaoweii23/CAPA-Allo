@@ -53,7 +53,7 @@ def parse_args():
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--weight_decay', type=float, default=1e-2)
     parser.add_argument('--warmup_epochs', type=int, default=5)
-    parser.add_argument('--patience', type=int, default=15)
+    parser.add_argument('--patience', type=int, default=20)
     parser.add_argument('--grad_clip', type=float, default=1.0)
     parser.add_argument('--noise_std', type=float, default=0.01)
     parser.add_argument('--device', type=str, default='cuda:3')

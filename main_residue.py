@@ -179,15 +179,34 @@ class SupConLoss(nn.Module):
         self.temperature = temperature
 
     def forward(self, features, labels):
-        if len(labels) < 2:
-            return torch.tensor(0.0, device=features.device)
+        device = features.device
+        if features.dim() != 2:
+            features = features.view(-1, features.size(-1))
+        labels = labels.contiguous().view(-1)
+
+
+        if features.size(0) < 2 or torch.unique(labels).numel() < 2:
+            return torch.tensor(0.0, device=device)
+
         features = F.normalize(features, dim=-1)
         sim = torch.matmul(features, features.T) / self.temperature
-        mask = torch.ones_like(sim) - torch.eye(len(features), device=features.device)
-        exp_sim = torch.exp(sim) * mask
-        log_prob = sim - torch.log(exp_sim.sum(dim=1, keepdim=True))
-        mean_log_prob_pos = (mask * log_prob).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-8)
-        return -mean_log_prob_pos.mean()
+
+
+        self_mask = torch.eye(features.size(0), dtype=torch.bool, device=device)
+
+        mask_same = (labels[:, None] == labels[None, :]) & (~self_mask)
+
+        sim_for_denom = sim.masked_fill(self_mask, -float('inf'))
+        log_prob = sim - torch.logsumexp(sim_for_denom, dim=1, keepdim=True)
+
+        mask_same_f = mask_same.float()
+        pos_count = mask_same_f.sum(dim=1)
+        valid = pos_count > 0
+        if not valid.any():
+            return torch.tensor(0.0, device=device)
+
+        mean_log_prob_pos = (mask_same_f * log_prob).sum(dim=1) / pos_count.clamp(min=1e-8)
+        return -mean_log_prob_pos[valid].mean()
 
 
 class InfoNCELoss(nn.Module):

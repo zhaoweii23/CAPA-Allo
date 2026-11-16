@@ -1,15 +1,4 @@
 #!/usr/bin/env python3
-"""
-AlloGator baseline training script.
-
-Full configuration (no ablation switches):
-  - ESM-2 sequence features + GVP geometric features (gated fusion)
-  - Pocket aggregation features + cross-attention aggregation
-  - Six losses: Focal, Dice, SupCon, InfoNCE, Neighbor, R-Drop
-  - EMA of model weights
-  - Predefined protein-level splits from --split_dir
-  - Raw (non-smoothed) probability evaluation
-"""
 
 import os, sys, argparse, pickle, logging, json
 from pathlib import Path

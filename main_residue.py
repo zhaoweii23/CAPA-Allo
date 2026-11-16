@@ -50,6 +50,9 @@ def parse_args():
     parser.add_argument('--lambda_rdrop', type=float, default=0.1)
     parser.add_argument('--pos_weight', type=float, default=150.0)
     parser.add_argument('--dynamic_pos_weight', action='store_true', default=False)
+    # SupCon sampling upper bound (prevents O(L^2) blow-up on long proteins)
+    parser.add_argument('--supcon_max_n', type=int, default=2000,
+                        help='Max number of residues fed into SupCon per protein (0 = no limit)')
     # Training
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--grad_accum', type=int, default=4)
@@ -174,6 +177,8 @@ class DiceLoss(nn.Module):
 
 
 class SupConLoss(nn.Module):
+    """Supervised contrastive loss with true same/different class masking."""
+
     def __init__(self, temperature=0.07):
         super().__init__()
         self.temperature = temperature
@@ -184,16 +189,13 @@ class SupConLoss(nn.Module):
             features = features.view(-1, features.size(-1))
         labels = labels.contiguous().view(-1)
 
-
         if features.size(0) < 2 or torch.unique(labels).numel() < 2:
             return torch.tensor(0.0, device=device)
 
         features = F.normalize(features, dim=-1)
         sim = torch.matmul(features, features.T) / self.temperature
 
-
         self_mask = torch.eye(features.size(0), dtype=torch.bool, device=device)
-
         mask_same = (labels[:, None] == labels[None, :]) & (~self_mask)
 
         sim_for_denom = sim.masked_fill(self_mask, -float('inf'))
@@ -207,6 +209,34 @@ class SupConLoss(nn.Module):
 
         mean_log_prob_pos = (mask_same_f * log_prob).sum(dim=1) / pos_count.clamp(min=1e-8)
         return -mean_log_prob_pos[valid].mean()
+
+
+def _subsample_for_supcon(proj, labels, max_n=2000):
+    """
+    Subsample residues so that SupCon does not allocate an L x L similarity matrix
+    on very long proteins. Preserves both classes; keeps at most max_n samples.
+    """
+    if max_n is None or max_n <= 0:
+        return proj, labels
+    N = proj.size(0)
+    if N <= max_n:
+        return proj, labels
+
+    device = proj.device
+    pos_idx = torch.where(labels == 1)[0]
+    neg_idx = torch.where(labels == 0)[0]
+    n_half = max_n // 2
+
+    n_pos = min(len(pos_idx), n_half)
+    n_neg = min(len(neg_idx), max_n - n_pos)
+    if n_pos + n_neg < max_n and n_pos < len(pos_idx):
+        # If negatives were not the bottleneck, allow extra positives to fill
+        n_pos = min(len(pos_idx), max_n - n_neg)
+
+    sel_pos = pos_idx[torch.randperm(len(pos_idx), device=device)[:n_pos]] if n_pos > 0 else pos_idx[:0]
+    sel_neg = neg_idx[torch.randperm(len(neg_idx), device=device)[:n_neg]] if n_neg > 0 else neg_idx[:0]
+    sel = torch.cat([sel_pos, sel_neg])
+    return proj[sel], labels[sel]
 
 
 class InfoNCELoss(nn.Module):
@@ -596,6 +626,7 @@ def train_epoch(model, ema, optimizer, criterion_dice, criterion_cont, criterion
     model.train()
     total_loss = 0.0
     total_bce = total_dice = total_cont = total_ssl = total_rdrop = 0.0
+    weights = adaptive_weights.get_weights()   # init in case loader is empty
 
     optimizer.zero_grad()
     for i, batch in enumerate(tqdm(loader, desc='Train', leave=False)):
@@ -629,12 +660,16 @@ def train_epoch(model, ema, optimizer, criterion_dice, criterion_cont, criterion
             )
             loss_dice = criterion_dice(logits1[valid_mask], labels[valid_mask].float())
 
-            pos_mask = (labels == 1) & valid_mask
-            if pos_mask.sum() >= 2:
-                pos_feats = proj1[pos_mask]
-                loss_cont = criterion_cont(pos_feats, torch.ones(pos_feats.size(0), device=device))
+            # ===== FIX: SupCon now uses BOTH positive and negative residues =====
+            proj_v = proj1[valid_mask]
+            labels_v = labels[valid_mask]
+            if proj_v.size(0) >= 2 and torch.unique(labels_v).numel() >= 2:
+                proj_c, labels_c = _subsample_for_supcon(
+                    proj_v, labels_v, max_n=getattr(args, 'supcon_max_n', 2000))
+                loss_cont = criterion_cont(proj_c, labels_c)
             else:
                 loss_cont = torch.tensor(0.0, device=device)
+            # ==================================================================
 
             loss_ssl = criterion_ssl(proj1, global_proj1, mask)
 
@@ -680,7 +715,7 @@ def train_epoch(model, ema, optimizer, criterion_dice, criterion_cont, criterion
         total_ssl += loss_ssl.item()
         total_rdrop += loss_rdrop.item()
 
-    n = len(loader)
+    n = max(len(loader), 1)
     logger.info(f"Loss weights: bce={weights[0].item():.3f}, dice={weights[1].item():.3f}, "
                 f"cont={weights[2].item():.3f}, ssl={weights[3].item():.3f}, rdrop={weights[4].item():.3f}")
     return (total_loss / n, total_bce / n, total_dice / n, total_cont / n, total_ssl / n, total_rdrop / n)

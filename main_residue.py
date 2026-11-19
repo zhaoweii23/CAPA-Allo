@@ -35,10 +35,10 @@ def parse_args():
                         help='Skip training and only aggregate existing test_results.json')
     parser.add_argument('--split_dir', type=str, default='./data_splits',
                         help='Directory containing train/val/test pdb id lists')
-    # Deprecated: kept for backward compatibility, not used
+
     parser.add_argument('--val_split', type=float, default=0.15)
     parser.add_argument('--test_split', type=float, default=0.15)
-    # Model hyperparameters
+
     parser.add_argument('--esm_dim', type=int, default=1280)
     parser.add_argument('--d_model', type=int, default=256)
     parser.add_argument('--nhead', type=int, default=8)
@@ -53,6 +53,10 @@ def parse_args():
     parser.add_argument('--dynamic_pos_weight', action='store_true', default=False)
     parser.add_argument('--supcon_max_n', type=int, default=2000,
                         help='Max number of residues fed into SupCon per protein (0 = no limit)')
+
+    parser.add_argument('--info_queue_size', type=int, default=256,
+                        help='Memory queue size for InfoNCE negative samples. '
+                             'Necessary because batch_size=1 provides no in-batch negatives.')
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--grad_accum', type=int, default=4)
     parser.add_argument('--epochs', type=int, default=200)
@@ -62,9 +66,9 @@ def parse_args():
     parser.add_argument('--patience', type=int, default=20)
     parser.add_argument('--grad_clip', type=float, default=1.0)
     parser.add_argument('--noise_std', type=float, default=0.01)
-    parser.add_argument('--device', type=str, default='cuda:1')
+    parser.add_argument('--device', type=str, default='cuda:6')
     parser.add_argument('--num_workers', type=int, default=0)
-    parser.add_argument('--save_dir', type=str, default='./Model_File/residue_v4_4_chain_exp')
+    parser.add_argument('--save_dir', type=str, default='./Model_File/residue_v4_4_chain_exp_main')
     parser.add_argument('--use_amp', action='store_true')
     return parser.parse_args()
 
@@ -123,7 +127,7 @@ def load_pkl_safe(pkl_path):
 
 def collect_proteins(pos_dir, neg_dir):
     samples = []
-    for pkl_path in Path(pos_dir).glob("*_features.pkl"):
+    for pkl_path in sorted(Path(pos_dir).glob("*_features.pkl")):
         try:
             feat = load_pkl_safe(str(pkl_path))
             esm = get_protein_esm(feat)
@@ -131,7 +135,7 @@ def collect_proteins(pos_dir, neg_dir):
                 samples.append({'pkl_path': str(pkl_path), 'label': 1})
         except Exception as e:
             logger.warning(f"Failed to load {pkl_path}: {e}")
-    for pkl_path in Path(neg_dir).glob("*_features.pkl"):
+    for pkl_path in sorted(Path(neg_dir).glob("*_features.pkl")):
         try:
             feat = load_pkl_safe(str(pkl_path))
             esm = get_protein_esm(feat)
@@ -162,7 +166,6 @@ def split_by_protein(df, val_split, test_split, seed):
     return df
 
 
-# ==================== Loss functions ====================
 class DiceLoss(nn.Module):
     def __init__(self, smooth=1e-6):
         super().__init__()
@@ -211,10 +214,7 @@ class SupConLoss(nn.Module):
 
 
 def _subsample_for_supcon(proj, labels, max_n=2000):
-    """
-    Subsample residues so that SupCon does not allocate an L x L similarity matrix
-    on very long proteins. Preserves both classes; keeps at most max_n samples.
-    """
+    """Subsample residues so that SupCon does not allocate an L x L similarity matrix."""
     if max_n is None or max_n <= 0:
         return proj, labels
     N = proj.size(0)
@@ -229,7 +229,6 @@ def _subsample_for_supcon(proj, labels, max_n=2000):
     n_pos = min(len(pos_idx), n_half)
     n_neg = min(len(neg_idx), max_n - n_pos)
     if n_pos + n_neg < max_n and n_pos < len(pos_idx):
-        # If negatives were not the bottleneck, allow extra positives to fill
         n_pos = min(len(pos_idx), max_n - n_neg)
 
     sel_pos = pos_idx[torch.randperm(len(pos_idx), device=device)[:n_pos]] if n_pos > 0 else pos_idx[:0]
@@ -239,26 +238,81 @@ def _subsample_for_supcon(proj, labels, max_n=2000):
 
 
 class InfoNCELoss(nn.Module):
-    def __init__(self, temperature=0.07):
+    """
+    Residue-vs-global InfoNCE with a memory queue.
+    Negative samples = global representations of other proteins in the current
+    mini-batch (when batch_size > 1) + global representations from recent
+    mini-batches stored in a FIFO queue. This makes the loss well-defined
+    even when batch_size = 1.
+    """
+    def __init__(self, temperature=0.07, queue_size=256):
         super().__init__()
         self.temperature = temperature
+        self.queue_size = queue_size
+        self.register_buffer('queue', torch.zeros(0, 0))
+        self.register_buffer('queue_ptr', torch.zeros(1, dtype=torch.long))
+
+    @torch.no_grad()
+    def _enqueue(self, keys):
+        if self.queue_size <= 0:
+            return
+        keys = keys.detach()
+        N, D = keys.shape
+        if N > self.queue_size:
+            keys = keys[-self.queue_size:]
+            N = keys.shape[0]
+        if self.queue.numel() == 0:
+            self.queue = torch.zeros(self.queue_size, D,
+                                     device=keys.device, dtype=keys.dtype)
+            self.queue_ptr.zero_()
+        ptr = int(self.queue_ptr.item())
+        if ptr + N <= self.queue_size:
+            self.queue[ptr:ptr + N] = keys
+            ptr = (ptr + N) % self.queue_size
+        else:
+            first = self.queue_size - ptr
+            self.queue[ptr:] = keys[:first]
+            self.queue[:N - first] = keys[first:]
+            ptr = N - first
+        self.queue_ptr[0] = ptr
 
     def forward(self, residue_feats, global_feats, mask):
         B, L, D = residue_feats.shape
         residue_feats = residue_feats[mask]
-        batch_idx = torch.arange(B, device=residue_feats.device).repeat_interleave(mask.sum(dim=1))
-        global_sel = global_feats[batch_idx]
-        residue_feats = F.normalize(residue_feats, dim=-1)
-        global_sel = F.normalize(global_sel, dim=-1)
-        pos_sim = (residue_feats * global_sel).sum(dim=-1) / self.temperature
-        neg_sim = torch.matmul(residue_feats, global_feats.T) / self.temperature
-        neg_sim[torch.arange(len(batch_idx)), batch_idx] = -float('inf')
-        logits = torch.cat([pos_sim.unsqueeze(1), neg_sim], dim=1)
-        labels = torch.zeros(len(batch_idx), dtype=torch.long, device=residue_feats.device)
-        return F.cross_entropy(logits, labels)
+        batch_idx = torch.arange(B, device=residue_feats.device) \
+                         .repeat_interleave(mask.sum(dim=1))
+
+        r = F.normalize(residue_feats, dim=-1)
+        g = F.normalize(global_feats, dim=-1)
+
+        # Positive: residue vs its own protein global
+        pos_sim = (r * g[batch_idx]).sum(-1, keepdim=True) / self.temperature
+
+        # Negatives from current batch (mask self)
+        neg_batch = torch.matmul(r, g.T) / self.temperature
+        if neg_batch.size(1) > 0:
+            neg_batch[torch.arange(len(batch_idx)), batch_idx] = -float('inf')
+
+        # Negatives from memory queue
+        if self.queue.numel() > 0:
+            q = F.normalize(self.queue, dim=-1)
+            neg_queue = torch.matmul(r, q.T) / self.temperature
+            neg_all = torch.cat([neg_batch, neg_queue], dim=1)
+        else:
+            neg_all = neg_batch
+
+        valid = torch.isfinite(neg_all).any(dim=1)
+        if valid.sum() == 0:
+            self._enqueue(global_feats)
+            return residue_feats.sum() * 0.0
+
+        logits = torch.cat([pos_sim, neg_all], dim=1)
+        target = torch.zeros(logits.size(0), dtype=torch.long, device=logits.device)
+        loss = F.cross_entropy(logits[valid], target[valid])
+        self._enqueue(global_feats)
+        return loss
 
 
-# ==================== Model components ====================
 class DropPath(nn.Module):
     def __init__(self, drop_prob=0.0):
         super().__init__()
@@ -502,13 +556,13 @@ class AdaptiveLossWeights:
         ])
 
     def get_weights(self):
-        return [torch.exp(-lv) for lv in self.log_vars]
+        # Clamp to avoid unbounded growth when a loss is identically zero
+        return [torch.exp(-lv.clamp(-10, 10)) for lv in self.log_vars]
 
     def parameters(self):
         return list(self.log_vars.parameters())
 
 
-# ==================== Dataset ====================
 class ResidueFullGVPDataset(Dataset):
     def __init__(self, df):
         self.df = df.reset_index(drop=True)
@@ -625,7 +679,7 @@ def train_epoch(model, ema, optimizer, criterion_dice, criterion_cont, criterion
     model.train()
     total_loss = 0.0
     total_bce = total_dice = total_cont = total_ssl = total_rdrop = 0.0
-    weights = adaptive_weights.get_weights()   # init in case loader is empty
+    weights = adaptive_weights.get_weights()
 
     optimizer.zero_grad()
     for i, batch in enumerate(tqdm(loader, desc='Train', leave=False)):
@@ -659,7 +713,7 @@ def train_epoch(model, ema, optimizer, criterion_dice, criterion_cont, criterion
             )
             loss_dice = criterion_dice(logits1[valid_mask], labels[valid_mask].float())
 
-            # ===== FIX: SupCon now uses BOTH positive and negative residues =====
+            # SupCon: use both positive and negative residues
             proj_v = proj1[valid_mask]
             labels_v = labels[valid_mask]
             if proj_v.size(0) >= 2 and torch.unique(labels_v).numel() >= 2:
@@ -668,7 +722,6 @@ def train_epoch(model, ema, optimizer, criterion_dice, criterion_cont, criterion
                 loss_cont = criterion_cont(proj_c, labels_c)
             else:
                 loss_cont = torch.tensor(0.0, device=device)
-            # ==================================================================
 
             loss_ssl = criterion_ssl(proj1, global_proj1, mask)
 
@@ -682,11 +735,11 @@ def train_epoch(model, ema, optimizer, criterion_dice, criterion_cont, criterion
                 loss_rdrop = torch.tensor(0.0, device=device)
 
             weights = adaptive_weights.get_weights()
-            loss = (weights[0] * loss_bce + 0.5 * adaptive_weights.log_vars[0] +
-                    weights[1] * loss_dice + 0.5 * adaptive_weights.log_vars[1] +
-                    weights[2] * loss_cont + 0.5 * adaptive_weights.log_vars[2] +
-                    weights[3] * loss_ssl + 0.5 * adaptive_weights.log_vars[3] +
-                    weights[4] * loss_rdrop + 0.5 * adaptive_weights.log_vars[4])
+            loss = (weights[0] * loss_bce + 0.5 * adaptive_weights.log_vars[0].clamp(-10, 10) +
+                    weights[1] * loss_dice + 0.5 * adaptive_weights.log_vars[1].clamp(-10, 10) +
+                    weights[2] * loss_cont + 0.5 * adaptive_weights.log_vars[2].clamp(-10, 10) +
+                    weights[3] * loss_ssl + 0.5 * adaptive_weights.log_vars[3].clamp(-10, 10) +
+                    weights[4] * loss_rdrop + 0.5 * adaptive_weights.log_vars[4].clamp(-10, 10))
 
         loss = loss / args.grad_accum
         if scaler:
@@ -813,6 +866,12 @@ def run_experiment(run_id, args, df):
         logger.info(f"[Run {run_id+1}] {s}: {len(sub)} proteins, "
                     f"allosteric ratio={sub['label'].mean():.2%}")
 
+    # Save test ids so downstream plotting scripts can read them
+    test_ids = sorted(df_run[df_run['split'] == 'test']['pdb_id'].unique())
+    with open(os.path.join(run_save_dir, 'test_pdb_ids.txt'), 'w') as f:
+        f.write('\n'.join(test_ids))
+    logger.info(f"[Run {run_id+1}] Saved {len(test_ids)} test pdb ids.")
+
     train_ds = ResidueFullGVPDataset(df_run[df_run['split'] == 'train'])
     val_ds = ResidueFullGVPDataset(df_run[df_run['split'] == 'val'])
     test_ds = ResidueFullGVPDataset(df_run[df_run['split'] == 'test'])
@@ -834,7 +893,8 @@ def run_experiment(run_id, args, df):
 
     criterion_dice = DiceLoss()
     criterion_cont = SupConLoss(temperature=args.temperature)
-    criterion_ssl = InfoNCELoss(temperature=args.temperature)
+    criterion_ssl = InfoNCELoss(temperature=args.temperature,
+                                queue_size=args.info_queue_size)
 
     adaptive_weights = AdaptiveLossWeights(device, num_losses=5)
     optimizer = AdamW([
@@ -842,15 +902,16 @@ def run_experiment(run_id, args, df):
         {'params': adaptive_weights.parameters()}
     ], lr=args.lr, weight_decay=args.weight_decay)
 
-    total_steps = max(1, len(train_loader) * args.epochs // args.grad_accum)
-    warmup_steps = max(1, len(train_loader) * args.warmup_epochs // args.grad_accum)
-    scheduler_cos = CosineAnnealingLR(optimizer, T_max=max(1, total_steps - warmup_steps))
-    scheduler_warm = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_steps)
+    # Scheduler operates per epoch (scheduler.step() is called once per epoch)
+    scheduler_cos = CosineAnnealingLR(
+        optimizer, T_max=max(1, args.epochs - args.warmup_epochs))
+    scheduler_warm = LinearLR(
+        optimizer, start_factor=0.01, total_iters=args.warmup_epochs)
     scheduler = SequentialLR(optimizer, schedulers=[scheduler_warm, scheduler_cos],
-                             milestones=[warmup_steps])
+                             milestones=[args.warmup_epochs])
 
     scaler = torch.amp.GradScaler('cuda') if args.use_amp else None
-    best_pp_auprc = 0.0
+    best_pp_auprc = -1.0
     patience_cnt = 0
 
     for epoch in range(1, args.epochs + 1):
@@ -886,7 +947,14 @@ def run_experiment(run_id, args, df):
                 logger.info("Early stopping")
                 break
 
-    model.load_state_dict(torch.load(os.path.join(run_save_dir, 'best_model.pt'), map_location=device))
+    best_model_path = os.path.join(run_save_dir, 'best_model.pt')
+    if not os.path.exists(best_model_path):
+        logger.warning("No best model was saved; saving current model as fallback.")
+        ema.apply_shadow()
+        torch.save(model.state_dict(), best_model_path)
+        ema.restore()
+
+    model.load_state_dict(torch.load(best_model_path, map_location=device))
     logger.info(f"[Run {run_id+1}] Loaded best model.")
 
     test_metrics = evaluate(model, test_loader, device, ema=None)
@@ -898,7 +966,7 @@ def run_experiment(run_id, args, df):
     return {'run': run_id + 1, 'test': test_metrics}
 
 
-# ==================== Main ====================
+
 def main():
     args = parse_args()
     set_seed(args.seed)

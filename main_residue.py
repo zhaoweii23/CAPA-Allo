@@ -18,11 +18,10 @@ from sklearn.metrics import (
 )
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s',
-                    handlers=[logging.FileHandler('residue_v4_4_chain.log'), logging.StreamHandler()])
+                    handlers=[logging.FileHandler('residue_v4_4_chain_B2.log'), logging.StreamHandler()])
 logger = logging.getLogger(__name__)
 
 
-# ==================== Argument parsing ====================
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--pos_dir', type=str, default='./data/processed/features_allosteric_pkl_saprot_0611')
@@ -35,10 +34,10 @@ def parse_args():
                         help='Skip training and only aggregate existing test_results.json')
     parser.add_argument('--split_dir', type=str, default='./data_splits',
                         help='Directory containing train/val/test pdb id lists')
-
+    # Deprecated: kept for backward compatibility, not used
     parser.add_argument('--val_split', type=float, default=0.15)
     parser.add_argument('--test_split', type=float, default=0.15)
-
+    # Model hyperparameters
     parser.add_argument('--esm_dim', type=int, default=1280)
     parser.add_argument('--d_model', type=int, default=256)
     parser.add_argument('--nhead', type=int, default=8)
@@ -53,11 +52,7 @@ def parse_args():
     parser.add_argument('--dynamic_pos_weight', action='store_true', default=False)
     parser.add_argument('--supcon_max_n', type=int, default=2000,
                         help='Max number of residues fed into SupCon per protein (0 = no limit)')
-
-    parser.add_argument('--info_queue_size', type=int, default=256,
-                        help='Memory queue size for InfoNCE negative samples. '
-                             'Necessary because batch_size=1 provides no in-batch negatives.')
-    parser.add_argument('--batch_size', type=int, default=1)
+    parser.add_argument('--batch_size', type=int, default=2)
     parser.add_argument('--grad_accum', type=int, default=4)
     parser.add_argument('--epochs', type=int, default=200)
     parser.add_argument('--lr', type=float, default=1e-4)
@@ -66,9 +61,9 @@ def parse_args():
     parser.add_argument('--patience', type=int, default=20)
     parser.add_argument('--grad_clip', type=float, default=1.0)
     parser.add_argument('--noise_std', type=float, default=0.01)
-    parser.add_argument('--device', type=str, default='cuda:6')
+    parser.add_argument('--device', type=str, default='cuda:1')
     parser.add_argument('--num_workers', type=int, default=0)
-    parser.add_argument('--save_dir', type=str, default='./Model_File/residue_v4_4_chain_exp_main')
+    parser.add_argument('--save_dir', type=str, default='./Model_File/residue_v4_4_chain_exp_B2')
     parser.add_argument('--use_amp', action='store_true')
     return parser.parse_args()
 
@@ -127,7 +122,7 @@ def load_pkl_safe(pkl_path):
 
 def collect_proteins(pos_dir, neg_dir):
     samples = []
-    for pkl_path in sorted(Path(pos_dir).glob("*_features.pkl")):
+    for pkl_path in Path(pos_dir).glob("*_features.pkl"):
         try:
             feat = load_pkl_safe(str(pkl_path))
             esm = get_protein_esm(feat)
@@ -135,7 +130,7 @@ def collect_proteins(pos_dir, neg_dir):
                 samples.append({'pkl_path': str(pkl_path), 'label': 1})
         except Exception as e:
             logger.warning(f"Failed to load {pkl_path}: {e}")
-    for pkl_path in sorted(Path(neg_dir).glob("*_features.pkl")):
+    for pkl_path in Path(neg_dir).glob("*_features.pkl"):
         try:
             feat = load_pkl_safe(str(pkl_path))
             esm = get_protein_esm(feat)
@@ -166,6 +161,7 @@ def split_by_protein(df, val_split, test_split, seed):
     return df
 
 
+# ==================== Loss functions ====================
 class DiceLoss(nn.Module):
     def __init__(self, smooth=1e-6):
         super().__init__()
@@ -214,7 +210,10 @@ class SupConLoss(nn.Module):
 
 
 def _subsample_for_supcon(proj, labels, max_n=2000):
-    """Subsample residues so that SupCon does not allocate an L x L similarity matrix."""
+    """
+    Subsample residues so that SupCon does not allocate an L x L similarity matrix
+    on very long proteins. Preserves both classes; keeps at most max_n samples.
+    """
     if max_n is None or max_n <= 0:
         return proj, labels
     N = proj.size(0)
@@ -229,6 +228,7 @@ def _subsample_for_supcon(proj, labels, max_n=2000):
     n_pos = min(len(pos_idx), n_half)
     n_neg = min(len(neg_idx), max_n - n_pos)
     if n_pos + n_neg < max_n and n_pos < len(pos_idx):
+        # If negatives were not the bottleneck, allow extra positives to fill
         n_pos = min(len(pos_idx), max_n - n_neg)
 
     sel_pos = pos_idx[torch.randperm(len(pos_idx), device=device)[:n_pos]] if n_pos > 0 else pos_idx[:0]
@@ -239,80 +239,49 @@ def _subsample_for_supcon(proj, labels, max_n=2000):
 
 class InfoNCELoss(nn.Module):
     """
-    Residue-vs-global InfoNCE with a memory queue.
-    Negative samples = global representations of other proteins in the current
-    mini-batch (when batch_size > 1) + global representations from recent
-    mini-batches stored in a FIFO queue. This makes the loss well-defined
-    even when batch_size = 1.
+    Residue-vs-global InfoNCE with same-batch negatives.
+
+    For each residue, the positive is the global projection of its own protein,
+    and negatives are global projections of other proteins in the same mini-batch.
+    With batch_size >= 2, at least one in-batch negative is available per residue.
+    Empty proteins (mask all False) are excluded from the negative set.
     """
-    def __init__(self, temperature=0.07, queue_size=256):
+
+    def __init__(self, temperature=0.07):
         super().__init__()
         self.temperature = temperature
-        self.queue_size = queue_size
-        self.register_buffer('queue', torch.zeros(0, 0))
-        self.register_buffer('queue_ptr', torch.zeros(1, dtype=torch.long))
-
-    @torch.no_grad()
-    def _enqueue(self, keys):
-        if self.queue_size <= 0:
-            return
-        keys = keys.detach()
-        N, D = keys.shape
-        if N > self.queue_size:
-            keys = keys[-self.queue_size:]
-            N = keys.shape[0]
-        if self.queue.numel() == 0:
-            self.queue = torch.zeros(self.queue_size, D,
-                                     device=keys.device, dtype=keys.dtype)
-            self.queue_ptr.zero_()
-        ptr = int(self.queue_ptr.item())
-        if ptr + N <= self.queue_size:
-            self.queue[ptr:ptr + N] = keys
-            ptr = (ptr + N) % self.queue_size
-        else:
-            first = self.queue_size - ptr
-            self.queue[ptr:] = keys[:first]
-            self.queue[:N - first] = keys[first:]
-            ptr = N - first
-        self.queue_ptr[0] = ptr
 
     def forward(self, residue_feats, global_feats, mask):
         B, L, D = residue_feats.shape
+        # Valid proteins (non-empty)
+        valid_protein = mask.sum(dim=1) > 0
+
         residue_feats = residue_feats[mask]
         batch_idx = torch.arange(B, device=residue_feats.device) \
                          .repeat_interleave(mask.sum(dim=1))
 
         r = F.normalize(residue_feats, dim=-1)
-        g = F.normalize(global_feats, dim=-1)
+        g = F.normalize(global_feats, dim=-1).to(r.dtype)
 
         # Positive: residue vs its own protein global
-        pos_sim = (r * g[batch_idx]).sum(-1, keepdim=True) / self.temperature
+        pos_sim = (r * g[batch_idx]).sum(dim=-1, keepdim=True) / self.temperature
 
-        # Negatives from current batch (mask self)
-        neg_batch = torch.matmul(r, g.T) / self.temperature
-        if neg_batch.size(1) > 0:
-            neg_batch[torch.arange(len(batch_idx)), batch_idx] = -float('inf')
+        # Negatives: residue vs all proteins (self column masked below)
+        neg_sim = torch.matmul(r, g.T) / self.temperature
+        neg_sim[torch.arange(len(batch_idx)), batch_idx] = -float('inf')
+        # Exclude empty proteins from negatives
+        if not valid_protein.all():
+            neg_sim[:, ~valid_protein] = -float('inf')
 
-        # Negatives from memory queue
-        if self.queue.numel() > 0:
-            q = F.normalize(self.queue, dim=-1)
-            neg_queue = torch.matmul(r, q.T) / self.temperature
-            neg_all = torch.cat([neg_batch, neg_queue], dim=1)
-        else:
-            neg_all = neg_batch
+        logits = torch.cat([pos_sim, neg_sim], dim=1)
+        target = torch.zeros(len(batch_idx), dtype=torch.long, device=r.device)
 
-        valid = torch.isfinite(neg_all).any(dim=1)
-        if valid.sum() == 0:
-            self._enqueue(global_feats)
-            return residue_feats.sum() * 0.0
-
-        logits = torch.cat([pos_sim, neg_all], dim=1)
-        target = torch.zeros(logits.size(0), dtype=torch.long, device=logits.device)
-        loss = F.cross_entropy(logits[valid], target[valid])
-        self._enqueue(global_feats)
-        return loss
+        # If no valid negative exists for some residues, cross_entropy will still
+        # produce a finite loss because -inf entries have probability 0.
+        return F.cross_entropy(logits, target)
 
 
+# ==================== Model components ====================
 class DropPath(nn.Module):
     def __init__(self, drop_prob=0.0):
         super().__init__()
@@ -556,13 +525,13 @@ class AdaptiveLossWeights:
         ])
 
     def get_weights(self):
-        # Clamp to avoid unbounded growth when a loss is identically zero
-        return [torch.exp(-lv.clamp(-10, 10)) for lv in self.log_vars]
+        return [torch.exp(-lv) for lv in self.log_vars]
 
     def parameters(self):
         return list(self.log_vars.parameters())
 
 
+# ==================== Dataset ====================
 class ResidueFullGVPDataset(Dataset):
     def __init__(self, df):
         self.df = df.reset_index(drop=True)
@@ -679,7 +648,7 @@ def train_epoch(model, ema, optimizer, criterion_dice, criterion_cont, criterion
     model.train()
     total_loss = 0.0
     total_bce = total_dice = total_cont = total_ssl = total_rdrop = 0.0
-    weights = adaptive_weights.get_weights()
+    weights = adaptive_weights.get_weights()   # init in case loader is empty
 
     optimizer.zero_grad()
     for i, batch in enumerate(tqdm(loader, desc='Train', leave=False)):
@@ -713,7 +682,7 @@ def train_epoch(model, ema, optimizer, criterion_dice, criterion_cont, criterion
             )
             loss_dice = criterion_dice(logits1[valid_mask], labels[valid_mask].float())
 
-            # SupCon: use both positive and negative residues
+            # SupCon: use BOTH positive and negative residues
             proj_v = proj1[valid_mask]
             labels_v = labels[valid_mask]
             if proj_v.size(0) >= 2 and torch.unique(labels_v).numel() >= 2:
@@ -735,11 +704,11 @@ def train_epoch(model, ema, optimizer, criterion_dice, criterion_cont, criterion
                 loss_rdrop = torch.tensor(0.0, device=device)
 
             weights = adaptive_weights.get_weights()
-            loss = (weights[0] * loss_bce + 0.5 * adaptive_weights.log_vars[0].clamp(-10, 10) +
-                    weights[1] * loss_dice + 0.5 * adaptive_weights.log_vars[1].clamp(-10, 10) +
-                    weights[2] * loss_cont + 0.5 * adaptive_weights.log_vars[2].clamp(-10, 10) +
-                    weights[3] * loss_ssl + 0.5 * adaptive_weights.log_vars[3].clamp(-10, 10) +
-                    weights[4] * loss_rdrop + 0.5 * adaptive_weights.log_vars[4].clamp(-10, 10))
+            loss = (weights[0] * loss_bce + 0.5 * adaptive_weights.log_vars[0] +
+                    weights[1] * loss_dice + 0.5 * adaptive_weights.log_vars[1] +
+                    weights[2] * loss_cont + 0.5 * adaptive_weights.log_vars[2] +
+                    weights[3] * loss_ssl + 0.5 * adaptive_weights.log_vars[3] +
+                    weights[4] * loss_rdrop + 0.5 * adaptive_weights.log_vars[4])
 
         loss = loss / args.grad_accum
         if scaler:
@@ -866,12 +835,6 @@ def run_experiment(run_id, args, df):
         logger.info(f"[Run {run_id+1}] {s}: {len(sub)} proteins, "
                     f"allosteric ratio={sub['label'].mean():.2%}")
 
-    # Save test ids so downstream plotting scripts can read them
-    test_ids = sorted(df_run[df_run['split'] == 'test']['pdb_id'].unique())
-    with open(os.path.join(run_save_dir, 'test_pdb_ids.txt'), 'w') as f:
-        f.write('\n'.join(test_ids))
-    logger.info(f"[Run {run_id+1}] Saved {len(test_ids)} test pdb ids.")
-
     train_ds = ResidueFullGVPDataset(df_run[df_run['split'] == 'train'])
     val_ds = ResidueFullGVPDataset(df_run[df_run['split'] == 'val'])
     test_ds = ResidueFullGVPDataset(df_run[df_run['split'] == 'test'])
@@ -893,8 +856,7 @@ def run_experiment(run_id, args, df):
 
     criterion_dice = DiceLoss()
     criterion_cont = SupConLoss(temperature=args.temperature)
-    criterion_ssl = InfoNCELoss(temperature=args.temperature,
-                                queue_size=args.info_queue_size)
+    criterion_ssl = InfoNCELoss(temperature=args.temperature)
 
     adaptive_weights = AdaptiveLossWeights(device, num_losses=5)
     optimizer = AdamW([
@@ -966,7 +928,7 @@ def run_experiment(run_id, args, df):
     return {'run': run_id + 1, 'test': test_metrics}
 
 
-
+# ==================== Main ====================
 def main():
     args = parse_args()
     set_seed(args.seed)
@@ -1020,7 +982,7 @@ def main():
                     f"{args.save_dir}/run{args.run_id+1}/")
         return
 
-    # Multi-run mode: skip completed, aggregate all available
+
     if args.summary_only:
         logger.info("summary_only mode: skip training, aggregate existing results")
         unfinished_runs = []
